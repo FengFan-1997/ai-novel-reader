@@ -4,6 +4,8 @@
 识别旁白和对白；Qwen3-TTS 通过 MLX 使用多种中文声线；原生识别“第一卷、第一章、
 序章、楔子、番外、尾声”等中文结构。
 
+公网入口、本地桥接、部署平台和离线行为见 [DEPLOYMENT.zh-CN.md](./DEPLOYMENT.zh-CN.md)。
+
 ## 要求与成本
 
 - Apple Silicon Mac（建议 16GB 内存）
