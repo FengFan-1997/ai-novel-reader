@@ -1,12 +1,13 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TTS-Story - Multi-Voice TTS</title>
+    <title>声阅 - AI 多角色小说阅读器</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%2326324a'/%3E%3Cpath d='M18 22h6v20h-6zM28 22h6v20h-6zM38 22h6v20h-6z' fill='%23a78bfa'/%3E%3Ccircle cx='32' cy='16' r='4' fill='%23fcd34d'/%3E%3Ccircle cx='32' cy='48' r='4' fill='%23fcd34d'/%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/static/css/style.css?v=33">
+    <link rel="stylesheet" href="/static/css/style.css?v=34">
     <link rel="stylesheet" href="/static/css/help.css?v=3">
+    <link rel="stylesheet" href="/static/css/reader-ui.css?v=5">
 </head>
 <body>
     <div class="container">
@@ -224,11 +225,11 @@
                                                 <option value="voxcpm_local">VoxCPM 1.5 · Local GPU</option>
                                                 <option value="pocket_tts">Pocket TTS · Clone Voices</option>
                                                 <option value="pocket_tts_preset">Pocket TTS · Preset Voices</option>
-                                                <option value="qwen3_custom">Qwen3-TTS · Custom Voice</option>
+                                                <option value="qwen3_custom">Qwen3-TTS · 中文角色声线</option>
                                                 <option value="qwen3_clone">Qwen3-TTS · Voice Clone</option>
                                                 <option value="omnivoice_clone">OmniVoice · Voice Clone</option>
                                                 <option value="kitten_tts">KittenTTS · CPU Lightweight</option>
-                                                <option value="index_tts">IndexTTS · Zero-Shot Clone</option>
+                                                <option value="index_tts">IndexTTS2 · 中文情绪阅读</option>
                                                 <option value="dots_tts">Dot.TTS · Voice Clone</option>
                                                 <option value="azure_speech">Microsoft Azure Speech · Cloud</option>
                                                 <option value="edge_tts">Microsoft Edge TTS · Experimental Cloud</option>
@@ -476,6 +477,23 @@
 
                         <!-- Qwen3 fields -->
                         <div id="voice-creation-qwen3-fields">
+                            <div class="qwen-voice-grid">
+                                <div class="form-group">
+                                    <label for="qwen-voice-preset">中文角色声线</label>
+                                    <select id="qwen-voice-preset">
+                                        <option value="">— 自定义声线 —</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="qwen-voice-acting-state">表演状态</label>
+                                    <select id="qwen-voice-acting-state">
+                                        <option value="neutral">自然</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <p class="help-text" id="qwen-voice-preset-help">
+                                先固定中文母语声线，再选择当前情绪；不会使用具体游戏角色或配音演员姓名。
+                            </p>
                             <div class="qwen-voice-grid">
                                 <div class="form-group">
                                     <label for="qwen-voice-name">Voice Name</label>
@@ -752,11 +770,11 @@
                                     <option value="voxcpm_local">VoxCPM 1.5 · Local GPU</option>
                                     <option value="pocket_tts">Pocket TTS · Clone Voices</option>
                                     <option value="pocket_tts_preset">Pocket TTS · Preset Voices</option>
-                                    <option value="qwen3_custom">Qwen3-TTS · Custom Voice</option>
+                                    <option value="qwen3_custom">Qwen3-TTS · 中文角色声线</option>
                                     <option value="qwen3_clone">Qwen3-TTS · Voice Clone</option>
                                     <option value="omnivoice_clone">OmniVoice · Voice Clone</option>
                                     <option value="kitten_tts">KittenTTS · CPU Lightweight</option>
-                                    <option value="index_tts">IndexTTS · Zero-Shot Clone</option>
+                                    <option value="index_tts">IndexTTS2 · 中文情绪阅读</option>
                                     <option value="dots_tts">Dot.TTS · Voice Clone</option>
                                     <option value="azure_speech">Microsoft Azure Speech · Cloud</option>
                                     <option value="edge_tts">Microsoft Edge TTS · Experimental Cloud</option>
@@ -1267,92 +1285,107 @@
                         <!-- IndexTTS Panel -->
                         <div class="engine-panel" id="engine-panel-index-tts">
                             <div class="section-title-inline settings-panel-title">
-                                <h4>IndexTTS</h4>
+                                <h4>IndexTTS2 · 中文情绪阅读</h4>
                                 <button type="button" class="help-icon" data-help-id="engine-index-tts" aria-label="Help: IndexTTS">?</button>
                             </div>
-                            <p class="help-text" style="margin-top:0;">Zero-shot voice cloning by Bilibili. Requires an isolated venv under <code>engines/index-tts/</code>. Uses the existing Voice Prompts library for reference audio.</p>
+                            <p class="help-text" style="margin-top:0;">把角色音色与情绪分开控制：保留同一声纹，同时根据正文和上下文驱动表演。完全本地运行，也能直接复用已经生成的中文角色声纹。</p>
                             <div class="settings-form-grid">
                                 <div class="form-group">
-                                    <label for="index-tts-model-version">Model Version</label>
+                                    <label for="index-tts-model-version">模型版本</label>
                                     <select id="index-tts-model-version">
-                                        <option value="IndexTTS-2">IndexTTS-2 (recommended cloning model)</option>
-                                        <option value="IndexTTS-1.5">IndexTTS-1.5 (stable, English-improved)</option>
-                                        <option value="IndexTTS">IndexTTS-1.0 (legacy)</option>
+                                        <option value="IndexTTS-2">IndexTTS2（支持独立情绪，推荐）</option>
                                     </select>
-                                    <small>Model weights must be downloaded to <code>engines/index-tts/checkpoints/</code>.</small>
+                                    <small>首次使用自动下载；要使用本页的情绪功能，请保持 IndexTTS2。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-chunk-size">Chunk Size (chars)</label>
+                                    <label for="index-tts-chunk-size">每段字数</label>
                                     <input type="number" id="index-tts-chunk-size" min="100" max="1000" step="50" value="400">
-                                    <small>Character limit per synthesis chunk (recommended 300&ndash;500).</small>
+                                    <small>建议 300&ndash;500 字；过长容易削弱句内情绪变化。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-device">Device</label>
-                                    <input type="text" id="index-tts-device" placeholder="auto">
-                                    <small>auto, cuda, cuda:0, cpu</small>
+                                    <label for="index-tts-emotion-strength">情绪强度</label>
+                                    <input type="number" id="index-tts-emotion-strength" min="0" max="1" step="0.05" value="1">
+                                    <small>整体倍率；每种情绪内部仍限制在 0.6 以内，避免情绪越强、声纹越不像。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-default-prompt">Default Voice Prompt</label>
+                                    <label>情绪分析</label>
+                                    <label class="checkbox-label">
+                                        <input type="checkbox" id="index-tts-auto-emotion" checked>
+                                        根据对白、相邻旁白和说话动作自动判断情绪
+                                    </label>
+                                </div>
+                                <div class="form-group">
+                                    <label for="index-tts-device">运行设备</label>
+                                    <select id="index-tts-device">
+                                        <option value="auto">自动选择（推荐）</option>
+                                        <option value="mps">苹果芯片 MPS</option>
+                                        <option value="cuda">NVIDIA CUDA</option>
+                                        <option value="cpu">仅 CPU（很慢）</option>
+                                    </select>
+                                    <small>苹果芯片保持“自动选择”即可。</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="index-tts-default-prompt">默认声纹参考</label>
                                     <input type="text" id="index-tts-default-prompt" placeholder="data/voice_prompts/...">
-                                    <small>Fallback reference audio when no per-speaker prompt is assigned.</small>
+                                    <small>角色没有单独选音色时使用；留空则优先复用角色声线库。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-num-beams">Beam Search Width</label>
+                                    <label for="index-tts-num-beams">搜索宽度</label>
                                     <input type="number" id="index-tts-num-beams" min="1" max="10" step="1" value="1">
-                                    <small><strong>1 = fastest</strong> (greedy/sampling). 3 = default quality. Higher = slower GPT stage with marginal quality gain.</small>
+                                    <small><strong>1 最快</strong>；提高后更慢，收益通常很小。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-diffusion-steps">Diffusion Steps</label>
+                                    <label for="index-tts-diffusion-steps">精细生成步数</label>
                                     <input type="number" id="index-tts-diffusion-steps" min="5" max="50" step="5" value="12">
-                                    <small><strong>10&ndash;15 = fast</strong>, good quality. 25 = default. 50 = max quality. Affects the s2mel stage (biggest bottleneck).</small>
+                                    <small><strong>10&ndash;15 较快且质量足够</strong>；越高越慢。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-temperature">Temperature</label>
+                                    <label for="index-tts-temperature">随机度</label>
                                     <input type="number" id="index-tts-temperature" min="0.1" max="2.0" step="0.05" value="0.8">
-                                    <small>GPT sampling randomness. <strong>0.5&ndash;0.7</strong> = consistent/stable. <strong>0.8</strong> = default. <strong>1.0+</strong> = more expressive/varied delivery.</small>
+                                    <small>0.5&ndash;0.7 更稳定，0.8 均衡；过高可能不稳定。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-top-p">Top-P (Nucleus Sampling)</label>
+                                    <label for="index-tts-top-p">候选范围（Top-P）</label>
                                     <input type="number" id="index-tts-top-p" min="0.1" max="1.0" step="0.05" value="0.8">
-                                    <small>Limits sampling to the top cumulative probability mass. Lower = more conservative token choices. Default: 0.8.</small>
+                                    <small>越低越保守，默认 0.8。</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="index-tts-top-k">Top-K</label>
                                     <input type="number" id="index-tts-top-k" min="1" max="200" step="1" value="30">
-                                    <small>Limits sampling to the top K tokens at each step. Default: 30. Higher = more variety.</small>
+                                    <small>每步保留的候选数量，默认 30。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-repetition-penalty">Repetition Penalty</label>
+                                    <label for="index-tts-repetition-penalty">重复抑制</label>
                                     <input type="number" id="index-tts-repetition-penalty" min="1.0" max="20.0" step="0.5" value="10.0">
-                                    <small>Penalises repeated mel tokens. Raise if you hear <strong>stuttering or looping</strong> artifacts. Default: 10.0.</small>
+                                    <small>出现结巴或循环时再小幅提高，默认 10。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-max-mel-tokens">Max Mel Tokens</label>
+                                    <label for="index-tts-max-mel-tokens">最长音频记号</label>
                                     <input type="number" id="index-tts-max-mel-tokens" min="200" max="4000" step="100" value="1500">
-                                    <small>Hard cap on output length per chunk (~22 tokens/sec). <strong>1500 &asymp; 68s</strong>. Raise for very long sentences; lower to speed up short chunks.</small>
+                                    <small>1500 约等于 68 秒；只有句子被截断时才需要提高。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label for="index-tts-max-text-tokens-per-segment">Max Text Tokens / Segment</label>
+                                    <label for="index-tts-max-text-tokens-per-segment">内部文本上限</label>
                                     <input type="number" id="index-tts-max-text-tokens-per-segment" min="20" max="300" step="10" value="120">
-                                    <small>How many text tokens the model processes per internal pass before splitting. Smaller = faster but may affect prosody at split points. Default: 120.</small>
+                                    <small>默认 120；过小会增加断句点。</small>
                                 </div>
                                 <div class="form-group">
-                                    <label>Options</label>
+                                    <label>实验性加速</label>
                                     <label class="checkbox-label">
-                                        <input type="checkbox" id="index-tts-use-fp16" checked>
-                                        Use FP16 (half-precision) &mdash; faster, less VRAM, tiny quality loss
+                                        <input type="checkbox" id="index-tts-use-fp16">
+                                        使用 FP16（主要面向 NVIDIA；苹果芯片会自动忽略）
                                     </label>
                                     <label class="checkbox-label">
                                         <input type="checkbox" id="index-tts-use-deepspeed">
-                                        Use DeepSpeed (optional speedup, may be slower on some systems)
+                                        使用 DeepSpeed（需单独安装）
                                     </label>
                                     <label class="checkbox-label">
-                                        <input type="checkbox" id="index-tts-use-torch-compile" checked>
-                                        Use torch.compile &mdash; JIT-compiles s2mel diffusion model. <strong>First run slow</strong>, subsequent runs faster.
+                                        <input type="checkbox" id="index-tts-use-torch-compile">
+                                        使用 torch.compile（首次生成会更慢）
                                     </label>
                                     <label class="checkbox-label">
-                                        <input type="checkbox" id="index-tts-use-accel" checked>
-                                        Use Accel &mdash; acceleration engine for GPT stage
+                                        <input type="checkbox" id="index-tts-use-accel">
+                                        使用 GPT 加速引擎
                                     </label>
                                 </div>
                             </div>
@@ -1939,11 +1972,11 @@
     <div class="modal-overlay hidden" id="auto-assign-modal-overlay">
         <div class="modal hidden" id="auto-assign-modal" style="max-width: 640px; width: 95%;">
             <div class="modal-header">
-                <h3>Auto Assign Voice Samples</h3>
+                <h3 id="auto-assign-title">Auto Assign Voice Samples</h3>
                 <button class="modal-close" id="auto-assign-modal-close">&times;</button>
             </div>
             <div class="modal-body">
-                <p class="help-text">Each detected speaker is matched to the closest voice sample by name. Adjust the threshold — only matches at or above it are auto-selected.</p>
+                <p class="help-text" id="auto-assign-help">Each detected speaker is matched to the closest voice sample by name. Adjust the threshold — only matches at or above it are auto-selected.</p>
                 <div class="auto-assign-threshold-row">
                     <label for="auto-assign-threshold-slider">Match threshold:</label>
                     <input type="range" id="auto-assign-threshold-slider" min="10" max="100" step="1" value="80">
@@ -1959,7 +1992,7 @@
                     <thead>
                         <tr>
                             <th>Speaker</th>
-                            <th>Matched Voice Sample</th>
+                            <th id="auto-assign-voice-header">Matched Voice Sample</th>
                             <th>Score</th>
                         </tr>
                     </thead>
@@ -2365,11 +2398,11 @@
                                     <option value="voxcpm_local">VoxCPM 1.5</option>
                                     <option value="pocket_tts">Pocket TTS · Clone</option>
                                     <option value="pocket_tts_preset">Pocket TTS · Preset</option>
-                                    <option value="qwen3_custom">Qwen3-TTS · Custom Voice</option>
+                                    <option value="qwen3_custom">Qwen3-TTS · 中文角色声线</option>
                                     <option value="qwen3_clone">Qwen3-TTS · Clone</option>
                                     <option value="omnivoice_clone">OmniVoice · Clone</option>
                                     <option value="kitten_tts">KittenTTS</option>
-                                    <option value="index_tts">IndexTTS</option>
+                                    <option value="index_tts">IndexTTS2 · 中文情绪阅读</option>
                                     <option value="dots_tts">Dot.TTS</option>
                                     <option value="azure_speech">Microsoft Azure Speech</option>
                                     <option value="edge_tts">Microsoft Edge TTS</option>
@@ -2404,5 +2437,6 @@
     <script src="/static/js/library.js?v=38"></script>
     <script src="/static/js/voice-manager.js?v=14"></script>
     <script src="/static/js/settings.js?v=10"></script>
+    <script src="/static/js/reader-ui.js?v=6"></script>
 </body>
 </html>

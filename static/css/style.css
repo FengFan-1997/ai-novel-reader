@@ -2454,6 +2454,31 @@ audio {
     box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
 }
 
+.speaker-preset-recommendation {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    background: rgba(14, 116, 144, 0.12);
+}
+
+.speaker-preset-recommendation small {
+    flex-basis: 100%;
+    color: var(--text-muted);
+}
+
+.speaker-preset-confidence {
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(34, 197, 94, 0.16);
+    color: #86efac;
+    font-size: 0.75rem;
+    font-weight: 700;
+}
+
 .speaker-profile-actions {
     display: flex;
     align-items: flex-start;
@@ -4615,6 +4640,16 @@ audio {
     border-radius: 4px;
     font-size: 0.8rem;
     font-weight: 500;
+}
+
+.library-chunk-emotion {
+    background: rgba(245, 158, 11, 0.16);
+    color: #fbbf24;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    white-space: nowrap;
 }
 
 .library-chunk-preview {

@@ -12,7 +12,10 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import soundfile as sf
-import torch
+try:
+    import torch
+except ImportError:  # pragma: no cover - optional engine dependency
+    torch = None  # type: ignore[assignment]
 
 from .base import EngineCapabilities, TtsEngineBase, VoiceAssignment
 from ..audio_effects import AudioPostProcessor, VoiceFXSettings
@@ -23,6 +26,8 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 try:
+    if torch is None:
+        raise ImportError("PyTorch is not installed")
     from huggingface_hub import snapshot_download
     from voxcpm import VoxCPM  # type: ignore
 

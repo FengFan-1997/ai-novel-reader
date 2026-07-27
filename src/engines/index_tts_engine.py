@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,12 @@ import soundfile as sf
 
 from .base import EngineCapabilities, TtsEngineBase, VoiceAssignment
 from ..audio_effects import AudioPostProcessor, VoiceFXSettings
+from ..chinese_voice_director import (
+    ACTING_STATES,
+    VOICE_PRESETS,
+    infer_acting_state,
+    resolve_acting_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +38,68 @@ INDEX_TTS_SAMPLE_RATE = 22050
 INDEX_TTS_DEFAULT_MODEL_VERSION = "IndexTTS-2"
 
 _ENGINE_ROOT = Path(__file__).resolve().parent.parent.parent / "engines" / "index-tts"
+
+# IndexTTS2 vector order from the official implementation:
+# happy, angry, sad, afraid, disgusted, melancholic, surprised, calm.
+# Vectors describe the direction; `alpha` controls the amount mixed into the
+# cloned speaker. Community testing and the official README both recommend
+# keeping text/vector emotion strength around 0.6 or lower to preserve identity.
+INDEX_TTS_EMOTION_PROFILES: Dict[str, Dict[str, object]] = {
+    "neutral": {
+        "vector": [0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0, 0.95],
+        "alpha": 0.32,
+    },
+    "bright": {
+        "vector": [0.72, 0.0, 0.0, 0.0, 0.0, 0.03, 0.25, 0.0],
+        "alpha": 0.56,
+    },
+    "gentle": {
+        "vector": [0.12, 0.0, 0.0, 0.0, 0.0, 0.18, 0.0, 0.70],
+        "alpha": 0.44,
+    },
+    "shy": {
+        "vector": [0.22, 0.0, 0.0, 0.15, 0.0, 0.18, 0.0, 0.45],
+        "alpha": 0.48,
+    },
+    "cold": {
+        "vector": [0.0, 0.0, 0.0, 0.0, 0.10, 0.20, 0.0, 0.70],
+        "alpha": 0.46,
+    },
+    "dangerous": {
+        "vector": [0.0, 0.20, 0.0, 0.10, 0.22, 0.18, 0.0, 0.30],
+        "alpha": 0.56,
+    },
+    "angry": {
+        "vector": [0.0, 0.82, 0.0, 0.0, 0.18, 0.0, 0.0, 0.0],
+        "alpha": 0.60,
+    },
+    "whisper": {
+        "vector": [0.0, 0.0, 0.0, 0.16, 0.0, 0.20, 0.0, 0.64],
+        "alpha": 0.44,
+    },
+}
+
+
+def index_tts_emotion_profile(
+    acting_state: Optional[str],
+    *,
+    strength: float = 1.0,
+) -> Dict[str, object]:
+    """Return a safe IndexTTS2 emotion vector for one acting state."""
+    state_id = (
+        str(acting_state or "neutral")
+        if str(acting_state or "neutral") in ACTING_STATES
+        else "neutral"
+    )
+    profile = INDEX_TTS_EMOTION_PROFILES[state_id]
+    bounded_strength = max(0.0, min(1.0, float(strength)))
+    return {
+        "state": state_id,
+        "label": ACTING_STATES[state_id]["label"],
+        "emo_vector": list(profile["vector"]),
+        "emo_alpha": round(float(profile["alpha"]) * bounded_strength, 4),
+        "use_random": False,
+    }
 
 
 def _find_venv_python(engine_root: Path) -> Optional[Path]:
@@ -68,7 +137,7 @@ class IndexTTSEngine(TtsEngineBase):
     name = "index_tts"
     capabilities = EngineCapabilities(
         supports_voice_cloning=True,
-        supports_emotion_tags=False,
+        supports_emotion_tags=True,
         supported_languages=["en", "zh"],
     )
 
@@ -91,6 +160,14 @@ class IndexTTSEngine(TtsEngineBase):
         max_text_tokens_per_segment: int = 120,
         device: Optional[str] = None,
         default_prompt: Optional[str] = None,
+        auto_emotion: bool = True,
+        emotion_strength: float = 1.0,
+        persona_design_model_id: str = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
+        persona_clone_model_id: str = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+        persona_stability_temperature: float = 0.35,
+        persona_stability_top_k: int = 20,
+        persona_stability_top_p: float = 0.9,
+        persona_stability_seed: int = 20260727,
         **_kwargs,
     ) -> None:
         self._engine_root = Path(engine_root) if engine_root else _ENGINE_ROOT
@@ -117,6 +194,14 @@ class IndexTTSEngine(TtsEngineBase):
         self._max_text_tokens_per_segment = max(20, int(max_text_tokens_per_segment))
         self._device = device or None
         self._default_prompt = (default_prompt or "").strip() or None
+        self._auto_emotion = bool(auto_emotion)
+        self._emotion_strength = max(0.0, min(1.0, float(emotion_strength)))
+        self._persona_design_model_id = persona_design_model_id
+        self._persona_clone_model_id = persona_clone_model_id
+        self._persona_stability_temperature = persona_stability_temperature
+        self._persona_stability_top_k = persona_stability_top_k
+        self._persona_stability_top_p = persona_stability_top_p
+        self._persona_stability_seed = persona_stability_seed
         self.post_processor = AudioPostProcessor()
 
         logger.info(
@@ -128,6 +213,168 @@ class IndexTTSEngine(TtsEngineBase):
     @property
     def sample_rate(self) -> int:
         return INDEX_TTS_SAMPLE_RATE
+
+    @staticmethod
+    def _is_narrator(meta: Dict) -> bool:
+        return str(meta.get("speaker") or "").strip().lower() in {
+            "narrator",
+            "旁白",
+        }
+
+    @staticmethod
+    def _is_following_attribution(text: object) -> bool:
+        """Keep post-dialogue context only when it looks like delivery/action attribution."""
+        return bool(
+            re.search(
+                r"说|道|问|答|喊|叫|喝|嚷|嘟囔|喃喃|开口|"
+                r"声音|语气|口吻|笑|哭|叹|低声|轻声|沉声|冷声",
+                str(text or ""),
+            )
+        )
+
+    @staticmethod
+    def _callback_payload(meta: Dict) -> Dict[str, object]:
+        payload: Dict[str, object] = {
+            "speaker": meta.get("speaker"),
+            "text": meta.get("text"),
+            "segment_index": meta.get("segment_index"),
+            "chunk_index": meta.get("chunk_index"),
+        }
+        if "chapter_index" in meta:
+            payload["chapter_index"] = meta.get("chapter_index", 0)
+        for key in (
+            "emotion",
+            "emotion_label",
+            "emotion_source",
+            "emotion_confidence",
+            "emotion_reason",
+            "emotion_driver",
+        ):
+            if meta.get(key) is not None:
+                payload[key] = meta.get(key)
+        return payload
+
+    def enrich_worker_chunks(
+        self,
+        worker_chunks: List[Dict],
+        chunk_meta: List[Dict],
+    ) -> tuple[List[Dict], List[Dict]]:
+        """Attach context-aware IndexTTS2 emotion controls to flat chunks."""
+        previous_identity: Optional[str] = None
+        previous_state: Optional[str] = None
+
+        for index, (worker_chunk, meta) in enumerate(
+            zip(worker_chunks, chunk_meta)
+        ):
+            assignment = meta.get("assignment")
+            if not isinstance(assignment, VoiceAssignment):
+                assignment = VoiceAssignment()
+            extra = assignment.extra or {}
+            explicit_emotion = meta.get("emotion")
+            manual_instruction = extra.get("instruct")
+            manual_state = resolve_acting_state(manual_instruction)
+            identity = str(
+                worker_chunk.get("spk_audio_prompt")
+                or assignment.voice
+                or meta.get("speaker")
+                or "default"
+            )
+
+            context_before = ""
+            context_after = ""
+            if index > 0 and self._is_narrator(chunk_meta[index - 1]):
+                context_before = str(chunk_meta[index - 1].get("text") or "")
+            if (
+                index + 1 < len(chunk_meta)
+                and self._is_narrator(chunk_meta[index + 1])
+                and self._is_following_attribution(
+                    chunk_meta[index + 1].get("text")
+                )
+            ):
+                context_after = str(chunk_meta[index + 1].get("text") or "")
+
+            adjacent_state = (
+                previous_state if previous_identity == identity else None
+            )
+            worker_chunk["smooth_emotion"] = adjacent_state is not None
+            if not self._auto_emotion and not explicit_emotion and not manual_state:
+                decision = infer_acting_state(
+                    meta.get("text"),
+                    explicit_instruction="自然",
+                )
+            else:
+                decision = infer_acting_state(
+                    meta.get("text"),
+                    explicit_instruction=(
+                        explicit_emotion
+                        or (manual_instruction if manual_state else None)
+                    ),
+                    default_state="neutral",
+                    previous_state=adjacent_state,
+                    context_before=context_before,
+                    context_after=context_after,
+                )
+
+            profile = index_tts_emotion_profile(
+                str(decision["state"]),
+                strength=self._emotion_strength,
+            )
+            worker_chunk.update(profile)
+            # IndexTTS2 ships a small Chinese semantic emotion model. For
+            # automatically directed dialogue, let it produce the nuanced
+            # eight-dimensional mix from the spoken line and nearby narration.
+            # Explicit story labels and manual role settings remain deterministic
+            # vectors so the author's/user's choice always wins.
+            use_semantic_emotion = (
+                self._auto_emotion
+                and not explicit_emotion
+                and not manual_state
+                and not self._is_narrator(meta)
+            )
+            if use_semantic_emotion:
+                emotion_text_parts: List[str] = []
+                if context_before:
+                    emotion_text_parts.append(f"前文旁白：{context_before[-160:]}")
+                emotion_text_parts.append(f"当前对白：{str(meta.get('text') or '')}")
+                if context_after:
+                    emotion_text_parts.append(f"后文旁白：{context_after[:120]}")
+                if decision.get("source") in {"automatic", "continuity"}:
+                    emotion_text_parts.append(
+                        f"连续表演参考：{decision.get('label') or '自然'}"
+                    )
+                worker_chunk.update(
+                    {
+                        "use_emo_text": True,
+                        "emo_text": "\n".join(emotion_text_parts),
+                        "emo_alpha": round(
+                            min(
+                                0.6,
+                                max(
+                                    float(worker_chunk.get("emo_alpha", 0.0)),
+                                    0.54 * self._emotion_strength,
+                                ),
+                            ),
+                            4,
+                        ),
+                    }
+                )
+            meta.update(
+                {
+                    "emotion": decision.get("state"),
+                    "emotion_label": decision.get("label"),
+                    "emotion_source": decision.get("source"),
+                    "emotion_confidence": decision.get("confidence"),
+                    "emotion_reason": decision.get("reason"),
+                    "emotion_driver": (
+                        "semantic_text" if use_semantic_emotion else "vector"
+                    ),
+                }
+            )
+            if not self._is_narrator(meta):
+                previous_identity = identity
+                previous_state = str(decision["state"])
+
+        return worker_chunks, chunk_meta
 
     def generate_batch(
         self,
@@ -145,6 +392,7 @@ class IndexTTSEngine(TtsEngineBase):
     ) -> List[str]:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        self.ensure_persona_voice_locks(voice_config)
 
         # Build flat list of chunks for the worker
         worker_chunks: List[Dict] = []
@@ -170,6 +418,7 @@ class IndexTTSEngine(TtsEngineBase):
                     "text": chunk_text,
                     "segment_index": seg_idx,
                     "chunk_index": local_idx,
+                    "emotion": segment.get("emotion"),
                     "output_path": str(output_path),
                     "assignment": assignment,
                     "_order_index": chunk_index,
@@ -178,6 +427,11 @@ class IndexTTSEngine(TtsEngineBase):
 
         if not worker_chunks:
             return []
+
+        worker_chunks, chunk_meta = self.enrich_worker_chunks(
+            worker_chunks,
+            chunk_meta,
+        )
 
         # Group by speaker so the model's internal voice-prompt cache stays hot.
         # Chunks with the same spk_audio_prompt run back-to-back; the worker
@@ -238,6 +492,8 @@ class IndexTTSEngine(TtsEngineBase):
             env = os.environ.copy()
             env["PYTHONPATH"] = str(self._engine_root)
             env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+            env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            env.setdefault("MODELSCOPE_DOWNLOAD_PARALLELS", "4")
 
             proc = subprocess.Popen(
                 [str(self._python), str(self._worker), "--job-file", job_file],
@@ -283,12 +539,7 @@ class IndexTTSEngine(TtsEngineBase):
                             if callable(chunk_cb):
                                 chunk_cb(
                                     meta["chunk_index"],
-                                    {
-                                        "speaker": meta["speaker"],
-                                        "text": meta["text"],
-                                        "segment_index": meta["segment_index"],
-                                        "chunk_index": meta["chunk_index"],
-                                    },
+                                    self._callback_payload(meta),
                                     done_path,
                                 )
 
@@ -386,12 +637,7 @@ class IndexTTSEngine(TtsEngineBase):
                 if callable(chunk_cb):
                     chunk_cb(
                         meta["chunk_index"],
-                        {
-                            "speaker": meta["speaker"],
-                            "text": meta["text"],
-                            "segment_index": meta["segment_index"],
-                            "chunk_index": meta["chunk_index"],
-                        },
+                        self._callback_payload(meta),
                         file_path,
                     )
 
@@ -420,6 +666,11 @@ class IndexTTSEngine(TtsEngineBase):
         """
         if not worker_chunks:
             return []
+
+        worker_chunks, chunk_meta = self.enrich_worker_chunks(
+            worker_chunks,
+            chunk_meta,
+        )
 
         if group_by_speaker and len(worker_chunks) > 1:
             seen_prompts: List[str] = []
@@ -450,6 +701,12 @@ class IndexTTSEngine(TtsEngineBase):
             "use_accel": self._use_accel,
             "num_beams": self._num_beams,
             "diffusion_steps": self._diffusion_steps,
+            "temperature": self._temperature,
+            "top_p": self._top_p,
+            "top_k": self._top_k,
+            "repetition_penalty": self._repetition_penalty,
+            "max_mel_tokens": self._max_mel_tokens,
+            "max_text_tokens_per_segment": self._max_text_tokens_per_segment,
             "device": self._device,
             "chunks": [{k: v for k, v in c.items() if not k.startswith("_")} for c in worker_chunks],
         }
@@ -466,6 +723,8 @@ class IndexTTSEngine(TtsEngineBase):
             env = os.environ.copy()
             env["PYTHONPATH"] = str(self._engine_root)
             env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+            env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            env.setdefault("MODELSCOPE_DOWNLOAD_PARALLELS", "4")
 
             proc = subprocess.Popen(
                 [str(self._python), str(self._worker), "--job-file", job_file],
@@ -511,13 +770,7 @@ class IndexTTSEngine(TtsEngineBase):
                             if callable(chunk_cb):
                                 chunk_cb(
                                     meta["chunk_index"],
-                                    {
-                                        "speaker": meta["speaker"],
-                                        "text": meta["text"],
-                                        "segment_index": meta["segment_index"],
-                                        "chunk_index": meta["chunk_index"],
-                                        "chapter_index": meta.get("chapter_index", 0),
-                                    },
+                                    self._callback_payload(meta),
                                     done_path,
                                 )
 
@@ -600,13 +853,7 @@ class IndexTTSEngine(TtsEngineBase):
                 if callable(chunk_cb):
                     chunk_cb(
                         meta["chunk_index"],
-                        {
-                            "speaker": meta["speaker"],
-                            "text": meta["text"],
-                            "segment_index": meta["segment_index"],
-                            "chunk_index": meta["chunk_index"],
-                            "chapter_index": meta.get("chapter_index", 0),
-                        },
+                        self._callback_payload(meta),
                         file_path,
                     )
 
@@ -650,6 +897,8 @@ class IndexTTSEngine(TtsEngineBase):
         try:
             env = os.environ.copy()
             env["PYTHONPATH"] = str(self._engine_root)
+            env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            env.setdefault("MODELSCOPE_DOWNLOAD_PARALLELS", "4")
             result = subprocess.run(
                 [str(self._python), str(self._worker), "--job-file", job_file],
                 capture_output=True,
@@ -697,6 +946,94 @@ class IndexTTSEngine(TtsEngineBase):
             f"Checked: {candidate}, {fallback}"
         )
 
+    def _resolve_persona_voice_lock(self, voice_name: Optional[str]) -> Optional[Path]:
+        """Reuse a Qwen-designed persona as IndexTTS2's timbre-only prompt."""
+        normalized = str(voice_name or "").strip()
+        if normalized not in VOICE_PRESETS:
+            return None
+        project_root = self._engine_root.parent.parent
+        cache_dir = project_root / "data" / "voice_locks"
+        patterns = (
+            f"{normalized}-neutral-*.wav",
+            f"{normalized}-{VOICE_PRESETS[normalized].get('default_state', 'neutral')}-*.wav",
+            f"{normalized}-*.wav",
+        )
+        for pattern in patterns:
+            candidates = sorted(
+                cache_dir.glob(pattern),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                return candidates[0].resolve()
+        return None
+
+    def ensure_persona_voice_locks(self, voice_config: Dict[str, Dict]) -> None:
+        """Create missing neutral persona anchors before the PyTorch worker loads."""
+        requested: Dict[str, Dict] = {}
+        for speaker_key in voice_config or {}:
+            assignment = self._voice_assignment_for(voice_config, speaker_key)
+            voice_name = str(assignment.voice or "").strip()
+            if (
+                voice_name in VOICE_PRESETS
+                and self._resolve_persona_voice_lock(voice_name) is None
+            ):
+                requested[voice_name] = {
+                    "voice": voice_name,
+                    "extra": {
+                        "language": (assignment.extra or {}).get("language")
+                        or "Chinese",
+                    },
+                }
+        if not requested:
+            return
+
+        logger.info(
+            "[index-tts] creating %d missing neutral persona anchor(s): %s",
+            len(requested),
+            ", ".join(sorted(requested)),
+        )
+        from .qwen3_custom_voice_engine import Qwen3CustomVoiceEngine
+
+        bootstrap = Qwen3CustomVoiceEngine(
+            model_id=self._persona_design_model_id,
+            clone_model_id=self._persona_clone_model_id,
+            default_language="Chinese",
+            auto_voice_lock=True,
+            stability_temperature=self._persona_stability_temperature,
+            stability_top_k=self._persona_stability_top_k,
+            stability_top_p=self._persona_stability_top_p,
+            stability_seed=self._persona_stability_seed,
+        )
+        try:
+            bootstrap._prepare_voice_locks(
+                requested,
+                required_states_by_voice={
+                    voice_name: {"neutral"} for voice_name in requested
+                },
+                include_preset_default=False,
+                switch_to_clone=False,
+            )
+        finally:
+            bootstrap.cleanup()
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                logger.debug("Unable to clear MLX cache after persona bootstrap", exc_info=True)
+
+        still_missing = [
+            voice_name
+            for voice_name in requested
+            if self._resolve_persona_voice_lock(voice_name) is None
+        ]
+        if still_missing:
+            raise RuntimeError(
+                "Could not create persona identity anchors for: "
+                + ", ".join(still_missing)
+            )
+
     def _resolve_prompt(self, assignment: VoiceAssignment) -> str:
         """Return the best available audio prompt path for this assignment."""
         logger.info("[index-tts] _resolve_prompt: audio_prompt_path=%r default=%r cwd=%s",
@@ -710,6 +1047,13 @@ class IndexTTSEngine(TtsEngineBase):
                 return resolved
             except FileNotFoundError as e:
                 logger.warning("[index-tts] prompt path failed: %s", e)
+        persona_prompt = self._resolve_persona_voice_lock(assignment.voice)
+        if persona_prompt:
+            logger.info(
+                "[index-tts] using Qwen persona identity prompt: %s",
+                persona_prompt,
+            )
+            return str(persona_prompt)
         if self._default_prompt:
             try:
                 resolved = str(self._resolve_prompt_path(self._default_prompt))
@@ -721,7 +1065,8 @@ class IndexTTSEngine(TtsEngineBase):
                 logger.warning("[index-tts] default prompt failed: %s", e)
         raise ValueError(
             "IndexTTS requires a reference audio prompt. "
-            "Assign a voice prompt to each speaker in the Generate tab."
+            "Assign a voice prompt, or first generate the selected Chinese "
+            "persona once so its local identity cache exists."
         )
 
     def _voice_assignment_for(
@@ -749,4 +1094,6 @@ __all__ = [
     "INDEX_TTS_AVAILABLE",
     "INDEX_TTS_UNAVAILABLE_REASON",
     "INDEX_TTS_SAMPLE_RATE",
+    "INDEX_TTS_EMOTION_PROFILES",
+    "index_tts_emotion_profile",
 ]

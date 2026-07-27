@@ -308,9 +308,10 @@ async function generateSpeakerVoicePromptBatch(speaker, displayName, statusEl, e
     const { profile } = findSpeakerProfile(speaker);
     const description = profile?.description || '';
     const voice = profile?.voice || '';
+    const presetId = profile?.recommended_preset || '';
     const instruct = description || '';
     const shortDescription = voice || '';
-    const sampleText = 'With this line of text, you will always know exactly where I stand, and what I sound like. Whether you like it or not. though, it may not be what you think.';
+    const sampleText = '雨刚停，长街上的灯一盏接一盏亮了起来。那人推开窗，笑着说道：“别急，我已经想到办法了。你愿意和我一起去看看吗？”';
     if (!shortDescription) {
         if (statusEl) {
             statusEl.textContent = `Skipped ${speaker}: missing voice type.`;
@@ -332,10 +333,11 @@ async function generateSpeakerVoicePromptBatch(speaker, displayName, statusEl, e
     const payload = {
         name: displayName || speaker,
         gender: parseGenderFromSpeakerName(speaker),
-        language: 'Auto',
+        language: 'Chinese',
         description: shortDescription,
         text: sampleText,
-        instruct
+        instruct,
+        preset_id: presetId || undefined
     };
     try {
         if (statusEl) {
@@ -891,10 +893,37 @@ function appendQwen3VoiceOptions(selectElement) {
     if (!qwen3Metadata || !Array.isArray(qwen3Metadata.speakers)) {
         return;
     }
+    const presets = Array.isArray(qwen3Metadata.presets) ? qwen3Metadata.presets : [];
+    if (qwen3Metadata.mode === 'voice_design' && presets.length) {
+        const groups = new Map();
+        presets.forEach(preset => {
+            const source = preset.source || '其他';
+            if (!groups.has(source)) groups.set(source, []);
+            groups.get(source).push(preset);
+        });
+        groups.forEach((items, source) => {
+            const group = document.createElement('optgroup');
+            group.label = source;
+            items.forEach(preset => {
+                const option = document.createElement('option');
+                option.value = preset.id;
+                option.textContent = preset.label || preset.name || preset.id;
+                const references = Array.isArray(preset.reference_characters)
+                    ? preset.reference_characters.join('、')
+                    : '';
+                option.title = references
+                    ? `${preset.description || ''}｜人设参考：${references}`
+                    : (preset.description || '');
+                group.appendChild(option);
+            });
+            selectElement.appendChild(group);
+        });
+        return;
+    }
     qwen3Metadata.speakers.forEach(speaker => {
         const option = document.createElement('option');
         option.value = speaker;
-        option.textContent = speaker;
+        option.textContent = qwen3Metadata.speakerLabels?.[speaker] || speaker;
         selectElement.appendChild(option);
     });
 }
@@ -911,7 +940,10 @@ async function loadQwen3Metadata(force = false) {
             throw new Error(data.error || 'Failed to load Qwen3 metadata');
         }
         qwen3Metadata = {
+            mode: data.mode || 'custom_voice',
             speakers: data.speakers || [],
+            speakerLabels: data.speaker_labels || {},
+            presets: data.presets || [],
             languages: data.languages || []
         };
         populateQwen3Controls();
@@ -929,10 +961,14 @@ function populateQwen3Controls() {
         qwen3Metadata.speakers.forEach(speaker => {
             const option = document.createElement('option');
             option.value = speaker;
-            option.textContent = speaker;
+            option.textContent = qwen3Metadata.speakerLabels?.[speaker] || speaker;
             speakerSelect.appendChild(option);
         });
-        if (previous) speakerSelect.value = previous;
+        if (previous && qwen3Metadata.speakers.includes(previous)) {
+            speakerSelect.value = previous;
+        } else if (qwen3Metadata.mode === 'voice_design' && qwen3Metadata.speakers.length) {
+            speakerSelect.value = qwen3Metadata.speakers[0];
+        }
     }
     if (languageSelect && qwen3Metadata?.languages) {
         const previous = languageSelect.value;
@@ -943,7 +979,11 @@ function populateQwen3Controls() {
             option.textContent = language;
             languageSelect.appendChild(option);
         });
-        if (previous) languageSelect.value = previous;
+        if (previous && Array.from(languageSelect.options).some(option => option.value === previous)) {
+            languageSelect.value = previous;
+        } else if (qwen3Metadata.mode === 'voice_design') {
+            languageSelect.value = 'chinese';
+        }
     }
     // Also update multi-voice assignment dropdowns if Qwen3 is selected
     const engineName = getSelectedJobEngine() || runtimeSettings?.tts_engine || 'kokoro';
@@ -1291,7 +1331,10 @@ function isKokoroEngine(engineName) {
 }
 
 function isQwenEngine(engineName) {
-    return (engineName || '').toLowerCase() === 'qwen3_custom';
+    const value = (engineName || '').toLowerCase();
+    // IndexTTS2 can reuse Qwen-designed Chinese persona anchors while
+    // rendering emotion through its own disentangled emotion vectors.
+    return value === 'qwen3_custom' || value === 'index_tts';
 }
 
 function isKittenEngine(engineName) {
@@ -1433,11 +1476,18 @@ function updateAssignmentModes(engineName) {
         document.querySelectorAll('#inline-voice-assignment-list .qwen3-language-select, #speaker-edit-modal-body .qwen3-language-select').forEach(select => {
             if (select.options.length <= 1) {
                 qwen3Metadata.languages.forEach(lang => {
+                    if (lang.toLowerCase() === 'auto' && Array.from(select.options).some(option => option.value.toLowerCase() === 'auto')) {
+                        return;
+                    }
                     const option = document.createElement('option');
                     option.value = lang;
                     option.textContent = lang;
                     select.appendChild(option);
                 });
+            }
+            if (qwen3Metadata.mode === 'voice_design' && select.value.toLowerCase() === 'auto') {
+                const chineseOption = Array.from(select.options).find(option => option.value.toLowerCase() === 'chinese');
+                if (chineseOption) select.value = chineseOption.value;
             }
         });
     }
@@ -2018,14 +2068,14 @@ function getSharedPreviewText() {
     const shared = document.getElementById('global-voice-preview-text');
     const value = shared?.value?.trim();
     if (value) return value;
-    return 'This is a quick preview line.';
+    return '雨刚停，长街上的灯一盏接一盏亮了起来。';
 }
 
 function buildDefaultSampleText(speaker) {
     if (!speaker || speaker === 'default') {
-        return 'This is a quick preview for the default narrator.';
+        return '夜色安静下来，远处的风穿过长街，带来潮湿的草木气息。';
     }
-    return `This is a quick preview line for ${speaker}.`;
+    return '别急，我已经想到办法了。你愿意和我一起去看看吗？';
 }
 
 function renderFxPanel(container, speaker, options = {}) {
@@ -2953,7 +3003,10 @@ function updateGeminiProgress({ visible, label, count, fill }) {
 }
 
 // Section heading chips management
-const DEFAULT_SECTION_HEADINGS = ['book', 'chapter', 'section', 'letter', 'part', 'prologue', 'epilogue'];
+const DEFAULT_SECTION_HEADINGS = [
+    'book', 'chapter', 'section', 'letter', 'part', 'prologue', 'epilogue',
+    '第…章', '第…节', '第…回', '第…篇', '序章', '楔子', '序言', '前言', '后记', '尾声', '番外'
+];
 let enabledSectionHeadings = [...DEFAULT_SECTION_HEADINGS];
 let customSectionHeadings = [];
 
@@ -3641,50 +3694,109 @@ function setupEventListeners() {
         return (2 * matches) / (sa.length + sb.length);
     }
 
+    function normalizeCastingText(value) {
+        return (value || '').toString().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+    }
+
+    function getAutoAssignChoices() {
+        const engineName = getSelectedJobEngine() || runtimeSettings?.tts_engine || 'kokoro';
+        if (isQwenEngine(engineName) && qwen3Metadata?.mode === 'voice_design') {
+            return (qwen3Metadata.presets || []).map(preset => ({
+                value: preset.id,
+                name: preset.label || preset.name || preset.id,
+                preset
+            }));
+        }
+        return (availableChatterboxVoices || []).map(voice => ({
+            value: (voice.prompt_path || voice.file_name || '').trim(),
+            name: voice.name || voice.prompt_path || voice.file_name || '',
+            voice
+        }));
+    }
+
+    function scoreQwenPresetForSpeaker(speaker, preset) {
+        const { profile } = findSpeakerProfile(speaker);
+        if (profile?.recommended_preset === preset.id) {
+            return Number(profile.recommendation_confidence) || 0.9;
+        }
+        const haystack = normalizeCastingText([
+            speaker,
+            profile?.name,
+            profile?.description,
+            profile?.voice
+        ].filter(Boolean).join(' '));
+        if (!haystack) return 0;
+
+        const identities = [preset.id, preset.name, ...(preset.reference_characters || [])];
+        if (identities.some(value => {
+            const token = normalizeCastingText(value);
+            return token && haystack.includes(token);
+        })) {
+            return 1;
+        }
+        let keywordMatches = 0;
+        (preset.match_keywords || []).forEach(keyword => {
+            const token = normalizeCastingText(keyword);
+            if (token && haystack.includes(token)) keywordMatches += 1;
+        });
+        let tagMatches = 0;
+        (preset.tags || []).forEach(tag => {
+            const token = normalizeCastingText(tag);
+            if (token && haystack.includes(token)) tagMatches += 1;
+        });
+        if (keywordMatches >= 2) return Math.min(0.96, 0.84 + keywordMatches * 0.03);
+        if (keywordMatches === 1) return Math.min(0.91, 0.84 + tagMatches * 0.02);
+        if (tagMatches >= 2) return 0.82;
+        return tagMatches === 1 ? 0.68 : 0;
+    }
+
     function buildAutoAssignProposals() {
         const speakers = Array.isArray(currentStats?.speakers) ? currentStats.speakers : [];
-        const voices = availableChatterboxVoices || [];
+        const choices = getAutoAssignChoices();
+        const qwenDesignMode = isQwenEngine(getSelectedJobEngine() || runtimeSettings?.tts_engine)
+            && qwen3Metadata?.mode === 'voice_design';
         return speakers.map(speaker => {
             let bestScore = 0;
-            let bestVoice = null;
-            voices.forEach(v => {
-                const score = fuzzyMatchScore(speaker, v.name || '');
+            let bestChoice = null;
+            choices.forEach(choice => {
+                const score = qwenDesignMode
+                    ? scoreQwenPresetForSpeaker(speaker, choice.preset || {})
+                    : fuzzyMatchScore(speaker, choice.name || '');
                 if (score > bestScore) {
                     bestScore = score;
-                    bestVoice = v;
+                    bestChoice = choice;
                 }
             });
             return {
                 speaker,
-                bestVoice,
+                bestChoice,
                 score: bestScore,
-                bestPromptValue: (bestVoice?.prompt_path || bestVoice?.file_name || '').trim()
+                bestValue: bestChoice?.value || ''
             };
         });
     }
 
     function renderAutoAssignTable(threshold) {
         const speakers = Array.isArray(currentStats?.speakers) ? currentStats.speakers : [];
-        const voices = availableChatterboxVoices || [];
-        if (!autoAssignTableBody || speakers.length === 0 || voices.length === 0) return;
+        const choices = getAutoAssignChoices();
+        if (!autoAssignTableBody || speakers.length === 0 || choices.length === 0) return;
         const proposals = buildAutoAssignProposals();
-        const sortedVoices = voices.slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        const sortedChoices = choices.slice().sort((a, b) => (a.name || '').localeCompare(b.name || '', 'zh-CN'));
         autoAssignTableBody.innerHTML = '';
-        proposals.forEach(({ speaker, score, bestPromptValue }) => {
+        proposals.forEach(({ speaker, score, bestValue }) => {
             const meetsThreshold = score >= threshold;
-            const promptValue = meetsThreshold ? bestPromptValue : '';
+            const selectedValue = meetsThreshold ? bestValue : '';
             const scoreClass = score >= 0.9 ? 'score-high' : score >= threshold ? 'score-med' : 'score-none';
             const scoreLabel = score > 0 ? `${Math.round(score * 100)}%` : 'No match';
-            const voiceOptions = sortedVoices
-                .map(v => {
-                    const vPath = (v.prompt_path || v.file_name || '').trim();
-                    const selected = vPath && vPath === promptValue ? ' selected' : '';
-                    return `<option value="${vPath}"${selected}>${v.name || vPath}</option>`;
+            const voiceOptions = sortedChoices
+                .map(choice => {
+                    const selected = choice.value && choice.value === selectedValue ? ' selected' : '';
+                    return `<option value="${escapeHtml(choice.value)}"${selected}>${escapeHtml(choice.name || choice.value)}</option>`;
                 })
                 .join('');
             const tr = document.createElement('tr');
             tr.innerHTML = `
-                <td class="speaker-name-cell">${speaker}</td>
+                <td class="speaker-name-cell">${escapeHtml(speaker)}</td>
                 <td>
                     <select class="auto-assign-voice-select" data-speaker="${speaker}">
                         <option value="">— No assignment —</option>
@@ -3701,13 +3813,33 @@ function setupEventListeners() {
         return (parseInt(autoAssignThresholdSlider?.value, 10) || 80) / 100;
     }
 
-    function openAutoAssignModal() {
+    async function openAutoAssignModal() {
         const speakers = Array.isArray(currentStats?.speakers) ? currentStats.speakers : [];
-        const voices = availableChatterboxVoices || [];
+        const engineName = getSelectedJobEngine() || runtimeSettings?.tts_engine || 'kokoro';
+        if (isQwenEngine(engineName) && !qwen3Metadata) {
+            await loadQwen3Metadata();
+        }
+        const qwenDesignMode = isQwenEngine(engineName) && qwen3Metadata?.mode === 'voice_design';
+        const choices = getAutoAssignChoices();
+        const title = document.getElementById('auto-assign-title');
+        const help = document.getElementById('auto-assign-help');
+        const voiceHeader = document.getElementById('auto-assign-voice-header');
+        if (title) title.textContent = qwenDesignMode ? '按人设智能分配中文声线' : 'Auto Assign Voice Samples';
+        if (help) {
+            help.textContent = qwenDesignMode
+                ? '根据人物档案、标签与角色名匹配原创中文声线。人设参考只用于选角方向，不会克隆官方角色或配音演员。'
+                : 'Each detected speaker is matched to the closest voice sample by name. Adjust the threshold — only matches at or above it are auto-selected.';
+        }
+        if (voiceHeader) voiceHeader.textContent = qwenDesignMode ? '推荐声线' : 'Matched Voice Sample';
 
         autoAssignNoSpeakers?.classList.toggle('hidden', speakers.length > 0);
-        autoAssignNoVoices?.classList.toggle('hidden', voices.length > 0);
-        autoAssignTable?.classList.toggle('hidden', speakers.length === 0 || voices.length === 0);
+        autoAssignNoVoices?.classList.toggle('hidden', choices.length > 0);
+        autoAssignTable?.classList.toggle('hidden', speakers.length === 0 || choices.length === 0);
+        if (autoAssignNoVoices) {
+            autoAssignNoVoices.textContent = qwenDesignMode
+                ? '中文人设声线库尚未载入。'
+                : 'No voice samples are available. Upload or generate voice samples first.';
+        }
 
         if (autoAssignThresholdSlider) {
             autoAssignThresholdSlider.value = 80;
@@ -3716,7 +3848,7 @@ function setupEventListeners() {
             autoAssignThresholdLabel.textContent = '80%';
         }
 
-        if (speakers.length > 0 && voices.length > 0) {
+        if (speakers.length > 0 && choices.length > 0) {
             renderAutoAssignTable(0.8);
         }
 
@@ -3732,25 +3864,36 @@ function setupEventListeners() {
 
     function applyAutoAssignSelections() {
         if (!autoAssignTableBody) return;
+        const qwenDesignMode = isQwenEngine(getSelectedJobEngine() || runtimeSettings?.tts_engine)
+            && qwen3Metadata?.mode === 'voice_design';
         autoAssignTableBody.querySelectorAll('.auto-assign-voice-select').forEach(select => {
             const speaker = select.dataset.speaker;
-            const promptValue = select.value?.trim();
+            const selectedValue = select.value?.trim();
             if (!speaker) return;
-            if (promptValue) {
-                turboSelectionState[speaker] = promptValue;
+            if (qwenDesignMode) {
+                document.querySelectorAll(
+                    `#inline-voice-assignment-list .voice-select[data-speaker="${speaker}"],` +
+                    `#speaker-edit-modal-body .voice-select[data-speaker="${speaker}"]`
+                ).forEach(voiceSelect => {
+                    voiceSelect.value = selectedValue || '';
+                });
             } else {
-                delete turboSelectionState[speaker];
+                if (selectedValue) {
+                    turboSelectionState[speaker] = selectedValue;
+                } else {
+                    delete turboSelectionState[speaker];
+                }
+                document.querySelectorAll(
+                    `#inline-voice-assignment-list .reference-select[data-speaker="${speaker}"],` +
+                    `#speaker-edit-modal-body .reference-select[data-speaker="${speaker}"]`
+                ).forEach(refSelect => {
+                    refSelect.value = selectedValue || '';
+                    const row = refSelect.closest('.voice-assignment-row');
+                    if (row) updateInlineSampleButtonState(row, { stopPlayback: false });
+                });
             }
-            document.querySelectorAll(
-                `#inline-voice-assignment-list .reference-select[data-speaker="${speaker}"],` +
-                `#speaker-edit-modal-body .reference-select[data-speaker="${speaker}"]`
-            ).forEach(refSelect => {
-                refSelect.value = promptValue || '';
-                const row = refSelect.closest('.voice-assignment-row');
-                if (row) updateInlineSampleButtonState(row, { stopPlayback: false });
-            });
         });
-        showNotification('Voice samples assigned.', 'success');
+        showNotification(qwenDesignMode ? '已按人物人设分配中文声线。' : 'Voice samples assigned.', 'success');
         closeAutoAssignModal();
     }
 
@@ -3913,7 +4056,7 @@ const engineDisplayNames = {
     'chatterbox_turbo_local': 'Chatterbox · Local GPU',
     'chatterbox_turbo_replicate': 'Chatterbox · Replicate',
     'voxcpm_local': 'VoxCPM 1.5 · Local GPU',
-    'qwen3_custom': 'Qwen3-TTS · Custom Voice',
+    'qwen3_custom': 'Qwen3-TTS · 中文角色声线',
     'qwen3_clone': 'Qwen3-TTS · Voice Clone',
     'pocket_tts': 'Pocket TTS · Clone',
     'pocket_tts_preset': 'Pocket TTS · Preset',
@@ -4042,7 +4185,15 @@ function setSpeakerProfiles(profiles) {
         speakerProfiles[normalized] = {
             name: profile?.name || key,
             description: profile?.description || '',
-            voice: profile?.voice || ''
+            voice: profile?.voice || '',
+            recommended_preset: profile?.recommended_preset || '',
+            recommendation_confidence: profile?.recommendation_confidence || 0,
+            recommendation_reasons: Array.isArray(profile?.recommendation_reasons)
+                ? profile.recommendation_reasons
+                : [],
+            voice_recommendations: Array.isArray(profile?.voice_recommendations)
+                ? profile.voice_recommendations
+                : []
         };
     });
 }
@@ -4073,6 +4224,10 @@ function updateSpeakerProfileEntry(speaker, updates = {}) {
         name: profile?.name || speaker,
         description: profile?.description || '',
         voice: profile?.voice || '',
+        recommended_preset: profile?.recommended_preset || '',
+        recommendation_confidence: profile?.recommendation_confidence || 0,
+        recommendation_reasons: profile?.recommendation_reasons || [],
+        voice_recommendations: profile?.voice_recommendations || [],
         ...updates
     };
     speakerProfiles[targetKey] = nextProfile;
@@ -4160,7 +4315,7 @@ async function generateSpeakerVoicePrompt(speaker) {
     const voice = profile?.voice || '';
     const instruct = description || '';
     const shortDescription = voice || '';
-    const sampleText = 'With this line of text, you will always know exactly where I stand, and what I sound like. Whether you like it or not. though, it may not be what you think.';
+    const sampleText = '雨刚停，长街上的灯一盏接一盏亮了起来。那人推开窗，笑着说道：“别急，我已经想到办法了。你愿意和我一起去看看吗？”';
     if (!shortDescription) {
         showNotification('Add a voice type before generating a voice.', 'warning');
         return;
@@ -4172,7 +4327,7 @@ async function generateSpeakerVoicePrompt(speaker) {
     const payload = {
         name: speaker,
         gender: parseGenderFromSpeakerName(speaker),
-        language: 'Auto',
+        language: 'Chinese',
         description: shortDescription,
         text: sampleText,
         instruct
@@ -4193,7 +4348,8 @@ async function generateSpeakerVoicePrompt(speaker) {
             body: JSON.stringify({
                 text: payload.text,
                 instruct: payload.instruct,
-                language: payload.language
+                language: payload.language,
+                preset_id: payload.preset_id
             })
         });
         const previewData = await previewResponse.json();
@@ -4250,6 +4406,64 @@ async function generateSpeakerVoicePrompt(speaker) {
     }
 }
 
+function findQwenPresetSummary(presetId) {
+    return (qwen3Metadata?.presets || []).find(preset => preset.id === presetId) || null;
+}
+
+function assignQwenPresetToSpeaker(speaker, presetId) {
+    if (!speaker || !presetId) return false;
+    let assigned = false;
+    document.querySelectorAll(
+        `#inline-voice-assignment-list .voice-select[data-speaker="${speaker}"],` +
+        `#speaker-edit-modal-body .voice-select[data-speaker="${speaker}"]`
+    ).forEach(select => {
+        if (Array.from(select.options).some(option => option.value === presetId)) {
+            select.value = presetId;
+            assigned = true;
+        }
+    });
+    return assigned;
+}
+
+async function refreshSpeakerPresetRecommendation(speaker) {
+    const { profile } = findSpeakerProfile(speaker);
+    const profileText = [
+        speaker,
+        profile?.name,
+        profile?.description,
+        profile?.voice
+    ].filter(Boolean).join(' ');
+    if (!profileText.trim()) {
+        showNotification('先填写人物档案或声线类型。', 'warning');
+        return;
+    }
+    try {
+        const response = await fetch('/api/qwen3/voice-design/recommend', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                profile: profileText,
+                gender: parseGenderFromSpeakerName(speaker),
+                limit: 3
+            })
+        });
+        const data = await response.json();
+        if (!data.success) throw new Error(data.error || '推荐失败');
+        const recommendations = data.recommendations || [];
+        const best = recommendations[0];
+        updateSpeakerProfileEntry(speaker, {
+            recommended_preset: best?.id || '',
+            recommendation_confidence: best?.confidence || 0,
+            recommendation_reasons: best?.reasons || [],
+            voice_recommendations: recommendations
+        });
+        renderSpeakerProfileSummary(speaker);
+        showNotification(best ? `推荐声线：${best.label}` : '没有找到合适的声线。', best ? 'success' : 'warning');
+    } catch (error) {
+        showNotification(error.message || '人物声线推荐失败。', 'warning');
+    }
+}
+
 function renderSpeakerProfileSummary(speaker) {
     const summary = document.getElementById('speaker-profile-summary');
     if (!summary) return;
@@ -4262,6 +4476,13 @@ function renderSpeakerProfileSummary(speaker) {
     const hasProfiles = Object.keys(speakerProfiles).length > 0;
     const description = profile?.description || '';
     const voice = profile?.voice || '';
+    const recommendedPreset = findQwenPresetSummary(profile?.recommended_preset)
+        || (profile?.voice_recommendations || []).find(item => item.id === profile?.recommended_preset)
+        || null;
+    const confidence = Number(profile?.recommendation_confidence) || 0;
+    const reasons = Array.isArray(profile?.recommendation_reasons)
+        ? profile.recommendation_reasons
+        : [];
     const emptyMessage = hasProfiles
         ? 'No profile matched this speaker yet.'
         : 'No speaker profile data yet. Run Prep Text first.';
@@ -4276,8 +4497,16 @@ function renderSpeakerProfileSummary(speaker) {
                     <strong>Voice Type:</strong>
                     <input class="speaker-profile-input" data-role="speaker-profile-voice" type="text" value="${escapeHtml(voice)}" placeholder="Not available yet." />
                 </label>
+                <div class="speaker-preset-recommendation">
+                    <strong>推荐中文声线：</strong>
+                    <span>${recommendedPreset ? escapeHtml(recommendedPreset.label || recommendedPreset.name) : '尚未推荐'}</span>
+                    ${recommendedPreset ? `<span class="speaker-preset-confidence">${Math.round(confidence * 100)}%</span>` : ''}
+                    ${reasons.length ? `<small>${escapeHtml(reasons.join('；'))}</small>` : ''}
+                </div>
             </div>
             <div class="speaker-profile-actions">
+                <button type="button" class="btn btn-primary btn-sm" data-role="speaker-apply-preset" ${recommendedPreset ? '' : 'disabled'}>采用推荐</button>
+                <button type="button" class="btn btn-secondary btn-sm" data-role="speaker-recommend-preset">更新推荐</button>
                 <button type="button" class="btn btn-secondary btn-sm" data-role="speaker-generate-voice">Generate Voice</button>
             </div>
         </div>
@@ -4285,6 +4514,8 @@ function renderSpeakerProfileSummary(speaker) {
     const descriptionInput = summary.querySelector('[data-role="speaker-profile-description"]');
     const voiceInput = summary.querySelector('[data-role="speaker-profile-voice"]');
     const generateBtn = summary.querySelector('[data-role="speaker-generate-voice"]');
+    const recommendBtn = summary.querySelector('[data-role="speaker-recommend-preset"]');
+    const applyPresetBtn = summary.querySelector('[data-role="speaker-apply-preset"]');
     if (descriptionInput) {
         descriptionInput.addEventListener('input', event => {
             updateSpeakerProfileEntry(speaker, { description: event.currentTarget.value || '' });
@@ -4297,6 +4528,18 @@ function renderSpeakerProfileSummary(speaker) {
     }
     if (generateBtn) {
         generateBtn.addEventListener('click', () => generateSpeakerVoicePrompt(speaker));
+    }
+    if (recommendBtn) {
+        recommendBtn.addEventListener('click', () => refreshSpeakerPresetRecommendation(speaker));
+    }
+    if (applyPresetBtn && recommendedPreset) {
+        applyPresetBtn.addEventListener('click', () => {
+            const applied = assignQwenPresetToSpeaker(speaker, recommendedPreset.id);
+            showNotification(
+                applied ? `已为 ${speaker} 采用 ${recommendedPreset.label}。` : '请先选择 Qwen3-TTS 生成引擎。',
+                applied ? 'success' : 'warning'
+            );
+        });
     }
     summary.classList.remove('hidden');
 }

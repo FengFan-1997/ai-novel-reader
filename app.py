@@ -16,6 +16,7 @@ import logging
 import math
 import mimetypes
 import os
+import platform
 import queue
 import re
 import shutil
@@ -49,6 +50,18 @@ from src.custom_voice_store import (
     replace_custom_voice,
     save_custom_voice,
 )
+from src.chinese_voice_director import (
+    CHINESE_SAMPLE_TEXT,
+    DEFAULT_CHINESE_SPEAKER_PROFILE_PROMPT,
+    PACING_RETRY_INSTRUCTION,
+    compose_voice_instruction,
+    get_voice_preset,
+    has_abnormally_slow_delivery,
+    list_acting_states,
+    list_voice_presets,
+    recommend_voice_presets,
+)
+from src.chinese_dialogue_tagger import tag_chinese_dialogue
 from src.document_extractor import extract_text_from_file, get_supported_formats
 from src.help_center import create_help_blueprint
 from src.library_metadata import get_custom_chapter_title
@@ -80,7 +93,11 @@ from src.engines.chatterbox_turbo_local_engine import (
     CHATTERBOX_TURBO_UNAVAILABLE_REASON,
 )
 from src.engines.voxcpm_local_engine import VOXCPM_AVAILABLE
-from src.engines.qwen3_custom_voice_engine import QWEN3_AVAILABLE
+from src.engines.qwen3_custom_voice_engine import (
+    QWEN3_AVAILABLE,
+    QWEN3_MLX_AVAILABLE,
+    QWEN3_PYTORCH_AVAILABLE,
+)
 from src.engines.qwen3_voice_clone_engine import QWEN3_AVAILABLE as QWEN3_CLONE_AVAILABLE
 from src.engines.omnivoice_clone_engine import (
     OMNIVOICE_AVAILABLE,
@@ -177,7 +194,44 @@ PREP_PROGRESS_DIR = Path("data/prep")
 PREP_PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
 JOB_METADATA_FILENAME = "metadata.json"
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
-DEFAULT_LLM_PROVIDER = "gemini"
+IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine().lower() == "arm64"
+DEFAULT_LLM_PROVIDER = "local"
+DEFAULT_QWEN3_CUSTOM_MODEL = (
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
+    if IS_APPLE_SILICON
+    else "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+)
+DEFAULT_QWEN3_CLONE_MODEL = (
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
+    if IS_APPLE_SILICON
+    else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+)
+DEFAULT_QWEN3_VOICE_DESIGN_MODEL = (
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
+    if IS_APPLE_SILICON
+    else "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+)
+DEFAULT_TTS_ENGINE = "qwen3_custom" if IS_APPLE_SILICON else "kokoro"
+DEFAULT_CHINESE_NOVEL_PROMPT = """你是一名中文有声书分镜编辑。把输入小说原文切分为旁白和人物对白，供多声线朗读。
+
+硬性规则：
+1. 保留原文每一个字，不改写、不润色、不概括、不增删剧情。
+2. 叙述、动作、心理、对白提示语、章节标题全部放入 [narrator]...[/narrator]。
+3. 引号内或明确的直接发言使用人物标签；同一行同时有提示语和对白时，必须按原文顺序拆成旁白块和人物块。
+4. 人物标签只能用小写英文字母、数字和连字符，最后一段必须是 male、female 或 neutral。根据当前原文自行生成标签，绝不能照抄本提示词中的词语当人物名。
+5. 没有说话的角色不能获得标签；无人回答、沉默、心理活动都属于旁白。
+6. 每段必须有完全匹配的开始和结束标签；标签外不允许出现任何文字。
+7. 每个标签块独占一行。不要输出解释、Markdown 代码框或思考过程。
+8. 明确有直接发言但说话者身份未知时，只能使用 [unknown-neutral]，不得猜测姓名。
+
+格式示范（只学习拆分方式；示例姓名和标签绝不能出现在正式输出；标点也必须原样保留）：
+输入：王强停下脚步，说：“走吧。”四周无人回应。
+输出：
+[narrator]王强停下脚步，说：[/narrator]
+[wang-qiang-male]“走吧。”[/wang-qiang-male]
+[narrator]四周无人回应。[/narrator]
+
+输出前自行核对：原文无遗漏；所有标签成对；旁白与对白归属正确。"""
 LIBRARY_CACHE_TTL = 5  # seconds
 MIN_CHATTERBOX_PROMPT_SECONDS = 5.0
 DEFAULT_CONFIG = {
@@ -198,8 +252,9 @@ DEFAULT_CONFIG = {
     "gemini_api_key": "",
     "gemini_model": DEFAULT_GEMINI_MODEL,
     "gemini_prompt": "",
+    "llm_prompt": DEFAULT_CHINESE_NOVEL_PROMPT,
     "gemini_prompt_presets": [],
-    "gemini_speaker_profile_prompt": "",
+    "gemini_speaker_profile_prompt": DEFAULT_CHINESE_SPEAKER_PROFILE_PROMPT,
     "llm_provider": DEFAULT_LLM_PROVIDER,
     "atlas_cloud_api_key": "",
     "atlas_cloud_base_url": DEFAULT_ATLAS_CLOUD_BASE_URL,
@@ -236,22 +291,22 @@ DEFAULT_CONFIG = {
     "elevenlabs_similarity_boost": 0.75,
     "elevenlabs_style": 0.0,
     "elevenlabs_use_speaker_boost": True,
-    "llm_local_provider": LLM_PROVIDER_LMSTUDIO,
-    "llm_local_base_url": DEFAULT_LOCAL_LLM_BASE_URLS[LLM_PROVIDER_LMSTUDIO],
-    "llm_local_model": "",
+    "llm_local_provider": LLM_PROVIDER_OLLAMA,
+    "llm_local_base_url": DEFAULT_LOCAL_LLM_BASE_URLS[LLM_PROVIDER_OLLAMA],
+    "llm_local_model": "qwen3:1.7b",
     "llm_local_api_key": "",
-    "llm_local_timeout": 120,
-    "llm_local_temperature": 0.2,
+    "llm_local_timeout": 600,
+    "llm_local_temperature": 0.1,
     "llm_local_top_p": 1.0,
     "llm_local_top_k": 0,
     "llm_local_repeat_penalty": 1.0,
-    "llm_local_max_tokens": 0,
-    "llm_local_disable_reasoning": False,
+    "llm_local_max_tokens": 8192,
+    "llm_local_disable_reasoning": True,
     "llm_gemini_chunk_size": 500,
     "llm_local_chunk_size": 500,
     "llm_gemini_chunk_chapters": True,
     "llm_local_chunk_chapters": True,
-    "tts_engine": "kokoro",
+    "tts_engine": DEFAULT_TTS_ENGINE,
     "chatterbox_turbo_local_default_prompt": "",
     "chatterbox_turbo_local_temperature": 0.8,
     "chatterbox_turbo_local_top_p": 0.95,
@@ -278,20 +333,26 @@ DEFAULT_CONFIG = {
     "voxcpm_local_inference_timesteps": 32,
     "voxcpm_local_normalize": True,  # Enable text normalization for numbers/abbreviations
     "voxcpm_local_denoise": False,
-    "qwen3_custom_model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "qwen3_custom_model_id": DEFAULT_QWEN3_CUSTOM_MODEL,
     "qwen3_custom_device": "auto",
     "qwen3_custom_dtype": "bfloat16",
     "qwen3_custom_attn_implementation": "flash_attention_2",
-    "qwen3_custom_default_language": "Auto",
-    "qwen3_custom_default_instruct": "",
-    "qwen3_clone_model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "qwen3_custom_default_language": "Chinese",
+    "qwen3_custom_default_instruct": "像日常聊天一样自然连贯地说，语速正常偏快，每秒约五个汉字。逗号只短暂停顿，句内不要断开，不要朗诵，不要拖长。",
+    "qwen3_custom_auto_voice_lock": True,
+    "qwen3_custom_clone_model_id": DEFAULT_QWEN3_CLONE_MODEL,
+    "qwen3_custom_stability_temperature": 0.35,
+    "qwen3_custom_stability_top_k": 20,
+    "qwen3_custom_stability_top_p": 0.9,
+    "qwen3_custom_stability_seed": 20260727,
+    "qwen3_clone_model_id": DEFAULT_QWEN3_CLONE_MODEL,
     "qwen3_clone_device": "auto",
     "qwen3_clone_dtype": "bfloat16",
     "qwen3_clone_attn_implementation": "flash_attention_2",
     "qwen3_clone_default_language": "Auto",
     "qwen3_clone_default_prompt": "",
     "qwen3_clone_default_prompt_text": "",
-    "qwen3_voice_design_model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    "qwen3_voice_design_model_id": DEFAULT_QWEN3_VOICE_DESIGN_MODEL,
     "pocket_tts_model_variant": "b6369a24",
     "pocket_tts_temp": 0.7,
     "pocket_tts_lsd_decode_steps": 1,
@@ -320,6 +381,8 @@ DEFAULT_CONFIG = {
     "index_tts_device": "auto",
     "index_tts_default_prompt": "",
     "index_tts_chunk_size": 400,
+    "index_tts_auto_emotion": True,
+    "index_tts_emotion_strength": 1.0,
     "dots_tts_model_id": "rednote-hilab/dots.tts-soar",
     "dots_tts_precision": "auto",
     "dots_tts_optimize": False,
@@ -390,6 +453,12 @@ QWEN3_CUSTOM_SETTING_KEYS = {
     "qwen3_custom_attn_implementation",
     "qwen3_custom_default_language",
     "qwen3_custom_default_instruct",
+    "qwen3_custom_auto_voice_lock",
+    "qwen3_custom_clone_model_id",
+    "qwen3_custom_stability_temperature",
+    "qwen3_custom_stability_top_k",
+    "qwen3_custom_stability_top_p",
+    "qwen3_custom_stability_seed",
 }
 QWEN3_CLONE_SETTING_KEYS = {
     "qwen3_clone_model_id",
@@ -459,6 +528,12 @@ QWEN3_CUSTOM_OPTION_ALIASES = {
     "attn_implementation": "qwen3_custom_attn_implementation",
     "default_language": "qwen3_custom_default_language",
     "default_instruct": "qwen3_custom_default_instruct",
+    "auto_voice_lock": "qwen3_custom_auto_voice_lock",
+    "clone_model_id": "qwen3_custom_clone_model_id",
+    "stability_temperature": "qwen3_custom_stability_temperature",
+    "stability_top_k": "qwen3_custom_stability_top_k",
+    "stability_top_p": "qwen3_custom_stability_top_p",
+    "stability_seed": "qwen3_custom_stability_seed",
 }
 QWEN3_CLONE_OPTION_ALIASES = {
     "model": "qwen3_clone_model_id",
@@ -750,8 +825,9 @@ def _normalize_index_tts_options(options: Dict[str, Any]) -> Dict[str, Any]:
             continue
         key = str(raw_key).strip().lower()
         if key == "index_tts_model_version":
-            v = (value or "IndexTTS-2").strip()
-            result[key] = v if v in {"IndexTTS-2", "IndexTTS-1.5", "IndexTTS"} else "IndexTTS-2"
+            # This product path relies on IndexTTS2's disentangled emotion
+            # controls; older checkpoints cannot satisfy the contract.
+            result[key] = "IndexTTS-2"
         elif key == "index_tts_use_fp16":
             result[key] = _coerce_bool(value)
         elif key == "index_tts_use_deepspeed":
@@ -783,6 +859,11 @@ def _normalize_index_tts_options(options: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = (value or "").strip()
         elif key == "index_tts_chunk_size":
             result[key] = _coerce_int(value, minimum=100, maximum=1000, fallback=400)
+        elif key == "index_tts_auto_emotion":
+            result[key] = _coerce_bool(value)
+        elif key == "index_tts_emotion_strength":
+            raw_strength = 1.0 if value is None or value == "" else value
+            result[key] = max(0.0, min(1.0, float(raw_strength)))
     return result
 
 
@@ -971,9 +1052,33 @@ def _normalize_chatterbox_turbo_replicate_options(options: Dict[str, Any]) -> Di
 def _apply_engine_option_overrides(config: Dict[str, Any], engine_name: str, options: Optional[Dict[str, Any]]):
     overrides = _normalize_engine_options(engine_name, options or {})
     config.update(overrides)
-# Allow headings like [narrator]\nChapter 1 or Chapter 1 without tags.
+# Allow headings like [narrator]\nChapter 1 / 第一章 without tags.
+CHINESE_NUMERAL_PATTERN = r"0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟"
+CHINESE_HEADING_SPACE = r"[ \t\u3000]"
+CHINESE_BOOK_HEADING_REGEX = (
+    rf"(?:第{CHINESE_HEADING_SPACE}*[{CHINESE_NUMERAL_PATTERN}]+"
+    rf"{CHINESE_HEADING_SPACE}*(?:卷|部)"
+    rf"|(?:卷|部){CHINESE_HEADING_SPACE}*[{CHINESE_NUMERAL_PATTERN}]+)"
+    rf"(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?"
+    rf"{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+)
+CHINESE_SECTION_HEADING_REGEX = (
+    rf"(?:第{CHINESE_HEADING_SPACE}*[{CHINESE_NUMERAL_PATTERN}]+"
+    rf"{CHINESE_HEADING_SPACE}*(?:章|节|回|篇)"
+    rf"(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?"
+    rf"{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|序章(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|楔子(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|序言(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|前言(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|后记(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|尾声(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|番外(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    r"|〈[^〉\n\r]{1,80}〉)"
+)
 BOOK_HEADING_PATTERN = re.compile(
-    r'^\s*(?:\[[^\]]+\]\s*)*(book\b[^\n\r]*)$',
+    rf'^\s*(?:\[[^\]]+\]\s*)*((?:book\b[^\n\r]*?)|(?:{CHINESE_BOOK_HEADING_REGEX}))'
+    r'(?:\s*\[/[a-zA-Z0-9_\-]+\]\s*)*$',
     re.IGNORECASE | re.MULTILINE
 )
 
@@ -992,6 +1097,8 @@ SECTION_HEADING_KEYWORDS = [
     "appendix",
     "author note",
     "author's note",
+    "第…章", "第…节", "第…回", "第…篇",
+    "序章", "楔子", "序言", "前言", "后记", "尾声", "番外",
 ]
 
 def _parse_section_headings_from_db(custom_heading: Optional[str]) -> Optional[Any]:
@@ -1058,10 +1165,10 @@ def _build_section_heading_pattern(section_headings: Optional[Any] = None) -> re
     if section_headings is None and not keywords:
         keywords = list(SECTION_HEADING_KEYWORDS)
     keyword_regex = "|".join(filter(None, (_keyword_to_regex(word) for word in keywords)))
-    if not keyword_regex:
-        keyword_regex = "chapter"
+    english_pattern = rf"(?:{keyword_regex})\b[^\n\r]*" if keyword_regex else r"(?!)"
     return re.compile(
-        rf'^\s*(?:\[[^\]]+\]\s*)*(({keyword_regex})\b[^\n\r]*)$',
+        rf'^\s*(?:\[[^\]]+\]\s*)*((?:{english_pattern})|(?:{CHINESE_SECTION_HEADING_REGEX}))'
+        r'(?:\s*\[/[a-zA-Z0-9_\-]+\]\s*)*$',
         re.IGNORECASE | re.MULTILINE
     )
 
@@ -1100,6 +1207,7 @@ gpu_inference_lock = threading.Lock()
 chunk_regen_executor = ThreadPoolExecutor(max_workers=1)
 qwen3_voice_design_model = None
 qwen3_voice_design_signature = None
+qwen3_voice_design_backend = None
 library_cache = {
     "items": None,
     "timestamp": 0.0,
@@ -1345,7 +1453,7 @@ def _validate_voice_assignments_for_engine(
 
         if engine_name == "index_tts":
             default_prompt = (config.get("index_tts_default_prompt") or "").strip()
-            if not prompt and not default_prompt:
+            if not prompt and not default_prompt and voice not in VOICE_PRESETS:
                 missing_prompts.append(speaker)
 
         if engine_name == "dots_tts":
@@ -1470,6 +1578,7 @@ def _perform_chunk_regeneration(
             "speaker": speaker,
             "text": regen_text,
             "chunks": [regen_text],
+            "emotion": chunk.get("emotion"),
         }]
         engine_name = _normalize_engine_name(config_snapshot.get("tts_engine"))
         
@@ -2092,7 +2201,10 @@ def _ensure_qwen3_model(model_id: str) -> Path:
 
 
 def _qwen3_voice_design_signature(config: Dict[str, Any]) -> str:
-    model_id = (config.get("qwen3_voice_design_model_id") or "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign").strip()
+    model_id = (
+        config.get("qwen3_voice_design_model_id")
+        or DEFAULT_QWEN3_VOICE_DESIGN_MODEL
+    ).strip()
     device = (config.get("qwen3_custom_device") or "auto").strip()
     dtype = (config.get("qwen3_custom_dtype") or "bfloat16").strip()
     attn = (config.get("qwen3_custom_attn_implementation") or "flash_attention_2").strip()
@@ -2101,15 +2213,42 @@ def _qwen3_voice_design_signature(config: Dict[str, Any]) -> str:
 
 def _get_qwen3_voice_design_model(config: Dict[str, Any]):
     if not QWEN3_AVAILABLE:
-        raise ImportError("qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode.")
+        raise ImportError(
+            "Qwen3-TTS is unavailable. Install mlx-audio on Apple Silicon "
+            "or qwen-tts on a CUDA machine."
+        )
     global qwen3_voice_design_model, qwen3_voice_design_signature
+    global qwen3_voice_design_backend
     config = config or {}
     signature = _qwen3_voice_design_signature(config)
     with tts_engine_lock:
         if qwen3_voice_design_model is not None and qwen3_voice_design_signature == signature:
             return qwen3_voice_design_model
+
+        model_id = (
+            config.get("qwen3_voice_design_model_id")
+            or DEFAULT_QWEN3_VOICE_DESIGN_MODEL
+        ).strip()
+        wants_mlx = model_id.lower().startswith("mlx-community/")
+        if wants_mlx or (IS_APPLE_SILICON and QWEN3_MLX_AVAILABLE):
+            if not QWEN3_MLX_AVAILABLE:
+                raise ImportError(
+                    "The selected Qwen3 VoiceDesign model requires mlx-audio "
+                    "on Apple Silicon."
+                )
+            from mlx_audio.tts.utils import load_model as load_mlx_model
+
+            if not wants_mlx:
+                model_id = DEFAULT_QWEN3_VOICE_DESIGN_MODEL
+            logger.info("Loading Qwen3 VoiceDesign MLX model=%s", model_id)
+            qwen3_voice_design_model = load_mlx_model(model_id)
+            qwen3_voice_design_signature = signature
+            qwen3_voice_design_backend = "mlx"
+            return qwen3_voice_design_model
+
+        if not QWEN3_PYTORCH_AVAILABLE:
+            raise ImportError("qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode.")
         from qwen_tts import Qwen3TTSModel  # type: ignore
-        model_id = (config.get("qwen3_voice_design_model_id") or "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign").strip()
         device = _resolve_qwen_device(config.get("qwen3_custom_device") or "auto")
         dtype = _resolve_qwen_dtype(config.get("qwen3_custom_dtype") or "bfloat16")
         attn = _resolve_qwen_attn(config.get("qwen3_custom_attn_implementation") or "flash_attention_2")
@@ -2128,6 +2267,7 @@ def _get_qwen3_voice_design_model(config: Dict[str, Any]):
             attn_implementation=attn or None,
         )
         qwen3_voice_design_signature = signature
+        qwen3_voice_design_backend = "pytorch"
         return qwen3_voice_design_model
 
 
@@ -2178,6 +2318,12 @@ def _engine_signature(engine_name: str, config: Dict) -> str:
             (config.get("qwen3_custom_attn_implementation") or "").strip(),
             (config.get("qwen3_custom_default_language") or "").strip(),
             (config.get("qwen3_custom_default_instruct") or "").strip(),
+            str(bool(config.get("qwen3_custom_auto_voice_lock", True))),
+            (config.get("qwen3_custom_clone_model_id") or "").strip(),
+            str(config.get("qwen3_custom_stability_temperature")),
+            str(config.get("qwen3_custom_stability_top_k")),
+            str(config.get("qwen3_custom_stability_top_p")),
+            str(config.get("qwen3_custom_stability_seed")),
         )
         return f"{engine_name}::{'|'.join(parts)}"
     if engine_name == "qwen3_clone":
@@ -2361,26 +2507,44 @@ def _create_engine(engine_name: str, config: Dict) -> TtsEngineBase:
 
     if engine_name == "qwen3_custom":
         if not QWEN3_AVAILABLE:
-            raise ImportError("qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode.")
+            raise ImportError(
+                "Qwen3-TTS is unavailable. Install mlx-audio on Apple Silicon "
+                "or qwen-tts on a CUDA machine."
+            )
         device = (config.get("qwen3_custom_device") or "auto").strip()
         return get_engine(
             "qwen3_custom",
             device=device or "auto",
-            model_id=(config.get("qwen3_custom_model_id") or "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice").strip(),
+            model_id=(config.get("qwen3_custom_model_id") or DEFAULT_QWEN3_CUSTOM_MODEL).strip(),
             dtype=(config.get("qwen3_custom_dtype") or "bfloat16").strip(),
             attn_implementation=(config.get("qwen3_custom_attn_implementation") or "flash_attention_2").strip(),
             default_language=(config.get("qwen3_custom_default_language") or "Auto").strip() or "Auto",
             default_instruct=(config.get("qwen3_custom_default_instruct") or "").strip() or None,
+            auto_voice_lock=bool(config.get("qwen3_custom_auto_voice_lock", True)),
+            clone_model_id=(
+                config.get("qwen3_custom_clone_model_id")
+                or config.get("qwen3_clone_model_id")
+                or DEFAULT_QWEN3_CLONE_MODEL
+            ).strip(),
+            stability_temperature=float(
+                config.get("qwen3_custom_stability_temperature", 0.35)
+            ),
+            stability_top_k=int(config.get("qwen3_custom_stability_top_k", 20)),
+            stability_top_p=float(config.get("qwen3_custom_stability_top_p", 0.9)),
+            stability_seed=int(config.get("qwen3_custom_stability_seed", 20260727)),
         )
 
     if engine_name == "qwen3_clone":
         if not QWEN3_CLONE_AVAILABLE:
-            raise ImportError("qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode.")
+            raise ImportError(
+                "Qwen3-TTS voice cloning is unavailable. Install mlx-audio on "
+                "Apple Silicon or qwen-tts on a CUDA machine."
+            )
         device = (config.get("qwen3_clone_device") or "auto").strip()
         return get_engine(
             "qwen3_clone",
             device=device or "auto",
-            model_id=(config.get("qwen3_clone_model_id") or "Qwen/Qwen3-TTS-12Hz-1.7B-Base").strip(),
+            model_id=(config.get("qwen3_clone_model_id") or DEFAULT_QWEN3_CLONE_MODEL).strip(),
             dtype=(config.get("qwen3_clone_dtype") or "bfloat16").strip(),
             attn_implementation=(config.get("qwen3_clone_attn_implementation") or "flash_attention_2").strip(),
             default_language=(config.get("qwen3_clone_default_language") or "Auto").strip() or "Auto",
@@ -2492,6 +2656,26 @@ def _create_engine(engine_name: str, config: Dict) -> TtsEngineBase:
             max_text_tokens_per_segment=int(config.get("index_tts_max_text_tokens_per_segment", 120)),
             device=device,
             default_prompt=(config.get("index_tts_default_prompt") or "").strip() or None,
+            auto_emotion=bool(config.get("index_tts_auto_emotion", True)),
+            emotion_strength=float(config.get("index_tts_emotion_strength", 1.0)),
+            persona_design_model_id=(
+                config.get("qwen3_custom_model_id") or DEFAULT_QWEN3_CUSTOM_MODEL
+            ).strip(),
+            persona_clone_model_id=(
+                config.get("qwen3_custom_clone_model_id") or DEFAULT_QWEN3_CLONE_MODEL
+            ).strip(),
+            persona_stability_temperature=float(
+                config.get("qwen3_custom_stability_temperature", 0.35)
+            ),
+            persona_stability_top_k=int(
+                config.get("qwen3_custom_stability_top_k", 20)
+            ),
+            persona_stability_top_p=float(
+                config.get("qwen3_custom_stability_top_p", 0.9)
+            ),
+            persona_stability_seed=int(
+                config.get("qwen3_custom_stability_seed", 20260727)
+            ),
         )
 
     if engine_name == "azure_speech":
@@ -2777,7 +2961,7 @@ def slugify_filename(value: str, default: str = "chapter", max_length: int = 60)
     """Create a filesystem-friendly slug."""
     if not value:
         return default
-    value = re.sub(r'[^A-Za-z0-9]+', '-', value)
+    value = re.sub(r'[^\w]+', '-', value, flags=re.UNICODE)
     value = re.sub(r'-{2,}', '-', value).strip('-')
     if max_length and len(value) > max_length:
         value = value[:max_length].rstrip('-')
@@ -2890,16 +3074,27 @@ def split_text_into_book_sections(text: str, section_headings: Optional[Any] = N
         books = _build_sections_from_matches(text, book_matches, "Book")
         for idx, book in enumerate(books, start=1):
             book_content = book.get("content") or ""
-            section_matches = list(section_pattern.finditer(book_content))
+            # A book section includes its own heading at the beginning. Remove that
+            # wrapper before looking for chapters so the volume title does not turn
+            # into a synthetic "Title" chapter.
+            chapter_content = book_content
+            removed_prefix = 0
+            book_heading = (book.get("heading") or "").strip()
+            if book_heading and chapter_content.startswith(book_heading):
+                removed_prefix = len(book_heading)
+                chapter_content = chapter_content[removed_prefix:].lstrip()
+                removed_prefix = len(book_content) - len(chapter_content)
+
+            section_matches = list(section_pattern.finditer(chapter_content))
             if section_matches:
                 chapters = _build_sections_from_matches(
-                    book_content,
+                    chapter_content,
                     section_matches,
                     "Chapter",
-                    base_offset=book.get("heading_start") or 0
+                    base_offset=(book.get("heading_start") or 0) + removed_prefix
                 )
             else:
-                clean_content = book_content.strip()
+                clean_content = chapter_content.strip()
                 chapters = []
                 if clean_content:
                     chapters.append({"title": "Full Book", "content": clean_content})
@@ -2935,6 +3130,13 @@ def _resolve_llm_chunk_chapters(config: Dict[str, Any]) -> bool:
 
 
 def _chunk_text_by_paragraph_words(text: str, max_words: int) -> List[str]:
+    """Chunk Latin text by words and CJK text by characters.
+
+    Chinese novels normally contain no spaces, so ``str.split()`` reports an
+    entire paragraph as one word. The mixed unit count keeps the existing
+    English behavior while treating each CJK character as one model-budget
+    unit.
+    """
     content = (text or "").strip()
     if not content:
         return []
@@ -2952,31 +3154,162 @@ def _chunk_text_by_paragraph_words(text: str, max_words: int) -> List[str]:
     current_words = 0
 
     for paragraph in paragraphs:
-        paragraph_words = len(paragraph.split())
-        if not current_parts:
-            current_parts = [paragraph]
-            current_words = paragraph_words
-            continue
-
-        if current_words >= max_words:
-            chunks.append("\n\n".join(current_parts).strip())
-            current_parts = [paragraph]
-            current_words = paragraph_words
-            continue
-
-        if current_words + paragraph_words > max_words:
-            current_parts.append(paragraph)
-            chunks.append("\n\n".join(current_parts).strip())
-            current_parts = []
-            current_words = 0
-            continue
-
-        current_parts.append(paragraph)
-        current_words += paragraph_words
+        for paragraph_part in _split_text_by_reading_units(paragraph, max_words):
+            part_words = _count_reading_units(paragraph_part)
+            if current_parts and current_words + part_words > max_words:
+                chunks.append("\n\n".join(current_parts).strip())
+                current_parts = []
+                current_words = 0
+            current_parts.append(paragraph_part)
+            current_words += part_words
 
     if current_parts:
         chunks.append("\n\n".join(current_parts).strip())
     return chunks
+
+
+_CJK_CHAR_RE = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af]"
+)
+_READING_UNIT_RE = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af]"
+    r"|[A-Za-z0-9]+(?:['’_-][A-Za-z0-9]+)*"
+)
+_SENTENCE_END_CHARS = frozenset(".!?。！？；;")
+_CLAUSE_END_CHARS = frozenset(",，、:：—")
+
+
+def _count_reading_units(text: str) -> int:
+    """Estimate model input size across whitespace and non-whitespace scripts."""
+    return len(_READING_UNIT_RE.findall(text or ""))
+
+
+def _split_text_by_reading_units(text: str, max_units: int) -> List[str]:
+    """Split an oversized paragraph without cutting normal CJK sentences."""
+    content = (text or "").strip()
+    if not content or _count_reading_units(content) <= max_units:
+        return [content] if content else []
+
+    pieces: List[str] = []
+    start = 0
+    unit_count = 0
+    last_sentence_boundary: Optional[int] = None
+    last_clause_boundary: Optional[int] = None
+    in_latin_token = False
+
+    for idx, char in enumerate(content):
+        is_cjk = bool(_CJK_CHAR_RE.match(char))
+        is_latin_word = char.isascii() and (char.isalnum() or char in "_-'")
+        if is_cjk:
+            unit_count += 1
+            in_latin_token = False
+        elif is_latin_word:
+            if not in_latin_token:
+                unit_count += 1
+            in_latin_token = True
+        else:
+            in_latin_token = False
+
+        if char in _SENTENCE_END_CHARS:
+            last_sentence_boundary = idx + 1
+        elif char in _CLAUSE_END_CHARS or char.isspace():
+            last_clause_boundary = idx + 1
+
+        if unit_count < max_units:
+            continue
+
+        cut_at = last_sentence_boundary or last_clause_boundary or (idx + 1)
+        if cut_at <= start:
+            cut_at = idx + 1
+        piece = content[start:cut_at].strip()
+        if piece:
+            pieces.append(piece)
+        start = cut_at
+        unit_count = _count_reading_units(content[start:idx + 1])
+        last_sentence_boundary = None
+        last_clause_boundary = None
+        in_latin_token = bool(
+            idx + 1 < len(content)
+            and content[idx].isascii()
+            and (content[idx].isalnum() or content[idx] in "_-'")
+        )
+
+    remainder = content[start:].strip()
+    if remainder:
+        pieces.append(remainder)
+    return pieces
+
+
+_SPEAKER_BLOCK_RE = re.compile(
+    r"\[([a-zA-Z0-9_\-]+)\](.*?)\[/\1\]",
+    re.DOTALL,
+)
+_SPEAKER_TAG_RE = re.compile(r"\[/?[a-zA-Z0-9_\-]+\]")
+
+
+def _validate_llm_text_fidelity(source_text: str, tagged_text: str) -> Tuple[bool, str]:
+    """Verify that an LLM only inserted balanced speaker tags.
+
+    Whitespace between tag blocks is ignored because the formatter deliberately
+    puts each block on its own line. All non-whitespace source characters must
+    remain byte-for-byte identical and in the same order.
+    """
+    output = (tagged_text or "").strip()
+    matches = list(_SPEAKER_BLOCK_RE.finditer(output))
+    if not matches:
+        return False, "LLM output contains no balanced speaker blocks"
+
+    cursor = 0
+    payload_parts: List[str] = []
+    for match in matches:
+        if output[cursor:match.start()].strip():
+            return False, "LLM output contains text outside speaker tags"
+        payload_parts.append(match.group(2))
+        cursor = match.end()
+    if output[cursor:].strip():
+        return False, "LLM output contains text outside speaker tags"
+
+    source_plain = _SPEAKER_TAG_RE.sub("", source_text or "")
+    output_plain = "".join(payload_parts)
+    source_compact = re.sub(r"\s+", "", source_plain)
+    output_compact = re.sub(r"\s+", "", output_plain)
+    if source_compact != output_compact:
+        return False, "LLM changed, omitted, duplicated, or reordered source text"
+    return True, ""
+
+
+def _recover_chinese_speaker_tags(
+    source_text: str,
+    llm_text: str,
+) -> Tuple[Optional[str], str, bool]:
+    """Validate LLM tags and fall back to deterministic Chinese dialogue tags.
+
+    The fallback is used only when the source contains supported Chinese
+    quotation marks.  It never rewrites source characters, so a small local LLM
+    can fail safely without turning the UI action into a dead end.
+    """
+    is_faithful, fidelity_error = _validate_llm_text_fidelity(source_text, llm_text)
+    if is_faithful:
+        return llm_text, "", False
+
+    fallback_text = tag_chinese_dialogue(source_text)
+    if fallback_text:
+        fallback_is_faithful, fallback_error = _validate_llm_text_fidelity(
+            source_text,
+            fallback_text,
+        )
+        if fallback_is_faithful:
+            logger.warning(
+                "LLM speaker tagging failed fidelity validation; "
+                "used deterministic Chinese dialogue fallback: %s",
+                fidelity_error,
+            )
+            return fallback_text, fidelity_error, True
+        fidelity_error = f"{fidelity_error}; fallback failed: {fallback_error}"
+
+    return None, fidelity_error, False
 
 
 def _append_llm_chunks(
@@ -3834,6 +4167,11 @@ def process_audio_job(job_data):
                 "speaker": segment.get("speaker"),
                 "engine": engine_name,
                 "emotion": segment.get("emotion"),
+                "emotion_label": segment.get("emotion_label"),
+                "emotion_source": segment.get("emotion_source"),
+                "emotion_confidence": segment.get("emotion_confidence"),
+                "emotion_reason": segment.get("emotion_reason"),
+                "emotion_driver": segment.get("emotion_driver"),
                 "text": segment.get("text"),
                 "file_path": file_path,
                 "relative_file": os.path.relpath(file_path, job_dir),
@@ -3891,13 +4229,28 @@ def process_audio_job(job_data):
                 "authors note",
                 "author's note",
             }
-            if normalized in non_chapter_sections:
-                fallback = normalized.replace("'", "").replace(" ", "-") or "section"
+            chinese_non_chapter_sections = {
+                "序章": "prologue", "楔子": "opening", "序言": "preface",
+                "前言": "foreword", "后记": "afterword", "尾声": "epilogue",
+                "番外": "extra",
+            }
+            chinese_special = next(
+                (fallback for heading, fallback in chinese_non_chapter_sections.items()
+                 if normalized.startswith(heading)),
+                None,
+            )
+            if normalized in non_chapter_sections or chinese_special:
+                fallback = (
+                    chinese_special
+                    or normalized.replace("'", "").replace(" ", "-")
+                    or "section"
+                )
                 folder_name = slugify_filename(title, fallback).lower()
                 return base_dir / folder_name, chapter_folder_idx, False, folder_name
 
             chapter_like = re.match(
-                r"^(chapter|book|part|section|letter)\b",
+                rf"^(?:(chapter|book|part|section|letter)\b|"
+                rf"第\s*[{CHINESE_NUMERAL_PATTERN}]+\s*(?:卷|部|章|节|回|篇))",
                 normalized,
                 flags=re.IGNORECASE,
             )
@@ -4047,6 +4400,8 @@ def process_audio_job(job_data):
             from src.engines.index_tts_engine import IndexTTSEngine  # noqa: F401
             if not isinstance(engine, (IndexTTSEngine, DotsTTSEngine)):
                 return
+            if isinstance(engine, IndexTTSEngine):
+                engine.ensure_persona_voice_locks(voice_assignments)
 
             engine_label = getattr(engine, "name", engine.__class__.__name__)
             logger.info("Job %s: %s batch mode — pre-collecting all chapters into one subprocess", job_id, engine_label)
@@ -4139,6 +4494,7 @@ def process_audio_job(job_data):
                         all_chunk_meta.append({
                             "speaker": speaker,
                             "text": chunk_text,
+                            "emotion": segment.get("emotion"),
                             "segment_index": seg_idx,
                             "chunk_index": local_idx,
                             "chapter_index": ch_idx,
@@ -5090,6 +5446,9 @@ def _serialize_chatterbox_voice(entry: Dict[str, Any]) -> Dict[str, Any]:
         "gender": entry.get("gender"),  # Male, Female, or None
         "language": entry.get("language"),  # Language code like en-US
         "description": entry.get("description"),
+        "instruct": entry.get("instruct"),
+        "preset_id": entry.get("preset_id"),
+        "acting_state": entry.get("acting_state"),
         "archived": bool(entry.get("archived", False)),
         "source": "local",  # local voices vs external
     }
@@ -5395,22 +5754,86 @@ def _apply_voice_design_cleanup(audio_data, sample_rate: int):
 
 def _generate_voice_design_preview(payload: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, str]:
     text = (payload.get("text") or "").strip()
-    instruct = (payload.get("instruct") or "").strip()
-    language = (payload.get("language") or "Auto").strip() or "Auto"
+    custom_instruct = (payload.get("instruct") or "").strip()
+    preset_id = (payload.get("preset_id") or "").strip()
+    acting_state = (payload.get("acting_state") or "").strip()
+    language = (payload.get("language") or "Chinese").strip() or "Chinese"
     if not text:
         raise ValueError("Text is required to generate a preview.")
+    # VoiceDesign requires a useful description.  Chinese requests always keep
+    # the native-Mandarin fluency baseline, even for a fully custom voice.
+    if preset_id or language.lower() in {"chinese", "zh", "zh-cn", "auto"}:
+        instruct = compose_voice_instruction(
+            preset_id or None,
+            acting_state=acting_state or None,
+            custom_instruction=custom_instruct or None,
+        )
+    else:
+        instruct = custom_instruct
+    if not instruct:
+        raise ValueError("Voice style instruction is required.")
 
     with gpu_inference_lock:
         model = _get_qwen3_voice_design_model(config)
-        wavs, sr = model.generate_voice_design(
-            text=text,
-            instruct=instruct or "",
-            language=language or "Auto",
-            non_streaming_mode=True,
-        )
-    if not wavs:
-        raise RuntimeError("No audio produced for preview.")
-    audio_data = _apply_voice_design_cleanup(wavs[0], int(sr))
+        if qwen3_voice_design_backend == "mlx":
+            import numpy as np
+
+            results = list(model.generate(
+                text=text,
+                instruct=instruct,
+                lang_code=language.lower(),
+                verbose=False,
+            ))
+            if not results:
+                raise RuntimeError("No audio produced for preview.")
+            audio_parts = [
+                np.asarray(result.audio, dtype=np.float32).reshape(-1)
+                for result in results
+            ]
+            audio_data = (
+                np.concatenate(audio_parts)
+                if len(audio_parts) > 1
+                else audio_parts[0]
+            )
+            sr = int(
+                getattr(results[0], "sample_rate", None)
+                or getattr(model, "sample_rate", 24000)
+            )
+            if has_abnormally_slow_delivery(text, len(audio_data), sr):
+                logger.warning("VoiceDesign preview was abnormally slow; retrying once.")
+                retry_results = list(model.generate(
+                    text=text,
+                    instruct=instruct + PACING_RETRY_INSTRUCTION,
+                    lang_code=language.lower(),
+                    verbose=False,
+                ))
+                if retry_results:
+                    retry_parts = [
+                        np.asarray(result.audio, dtype=np.float32).reshape(-1)
+                        for result in retry_results
+                    ]
+                    retry_audio = (
+                        np.concatenate(retry_parts)
+                        if len(retry_parts) > 1
+                        else retry_parts[0]
+                    )
+                    if len(retry_audio) < len(audio_data):
+                        audio_data = retry_audio
+                        sr = int(
+                            getattr(retry_results[0], "sample_rate", None)
+                            or getattr(model, "sample_rate", sr)
+                        )
+        else:
+            wavs, sr = model.generate_voice_design(
+                text=text,
+                instruct=instruct,
+                language=language,
+                non_streaming_mode=True,
+            )
+            if not wavs:
+                raise RuntimeError("No audio produced for preview.")
+            audio_data = wavs[0]
+    audio_data = _apply_voice_design_cleanup(audio_data, int(sr))
     buffer = io.BytesIO()
     sf.write(buffer, audio_data, int(sr), format="wav")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -5426,6 +5849,9 @@ def _save_voice_design_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     gender = (payload.get("gender") or "").strip() or None
     language = (payload.get("language") or "Auto").strip() or "Auto"
     description = (payload.get("description") or "").strip() or None
+    instruct = (payload.get("instruct") or "").strip() or None
+    preset_id = (payload.get("preset_id") or "").strip() or None
+    acting_state = (payload.get("acting_state") or "").strip() or None
     audio_base64 = payload.get("audio_base64")
 
     if not name:
@@ -5440,7 +5866,9 @@ def _save_voice_design_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         raise ValueError("Invalid audio payload.") from exc
 
-    slug = _slugify_filename(name)
+    # Preset IDs are ASCII and stable across platforms; Chinese display names
+    # otherwise collapse to a generic "voice" filename.
+    slug = _slugify_filename(preset_id or name)
     target_path = VOICE_PROMPT_DIR / f"{slug}.wav"
     counter = 1
     while target_path.exists():
@@ -5473,6 +5901,9 @@ def _save_voice_design_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "gender": gender,
         "language": language if language and language != "Auto" else None,
         "description": description,
+        "instruct": instruct,
+        "preset_id": preset_id,
+        "acting_state": acting_state,
     }
     entries.append(entry)
     _save_chatterbox_voice_entries(entries)
@@ -6286,6 +6717,12 @@ def _serialize_chunk_for_response(job_id: str, chunk: Dict[str, Any]) -> Dict[st
         "regenerated_at": chunk.get("regenerated_at"),
         "voice": chunk.get("voice_label"),
         "voice_assignment": chunk.get("voice_assignment"),
+        "emotion": chunk.get("emotion"),
+        "emotion_label": chunk.get("emotion_label"),
+        "emotion_source": chunk.get("emotion_source"),
+        "emotion_confidence": chunk.get("emotion_confidence"),
+        "emotion_reason": chunk.get("emotion_reason"),
+        "emotion_driver": chunk.get("emotion_driver"),
     }
 
 
@@ -7703,7 +8140,11 @@ def process_text_with_gemini():
                     "error": "Gemini API key not configured"
                 }), 400
 
-        prompt_prefix = prompt_override or (config.get('gemini_prompt') or '').strip()
+        prompt_prefix = (
+            prompt_override
+            or (config.get('llm_prompt') or '').strip()
+            or (config.get('gemini_prompt') or '').strip()
+        )
 
         sections = build_gemini_sections(text, prefer_chapters, config, section_headings)
         if not sections:
@@ -7727,6 +8168,16 @@ def process_text_with_gemini():
                 sorted(known_speakers)
             )
             response_text = _run_llm_prompt(combined_prompt, config)
+            recovered_text, fidelity_error, used_fallback = _recover_chinese_speaker_tags(
+                chapter_text,
+                response_text,
+            )
+            if recovered_text is None:
+                raise LocalLLMProcessorError(
+                    f"Section {idx} failed source-text validation: {fidelity_error}. "
+                    "No altered text was accepted; retry this section."
+                )
+            response_text = recovered_text
             detected_speakers = text_processor.extract_speakers(response_text)
             for speaker_name in detected_speakers:
                 known_speakers.add(speaker_name)
@@ -7735,7 +8186,8 @@ def process_text_with_gemini():
                 "title": section.get('title'),
                 "source": section.get('source'),
                 "output": response_text.strip(),
-                "speakers": detected_speakers
+                "speakers": detected_speakers,
+                "used_fallback": used_fallback,
             })
 
         if not processed_sections:
@@ -7795,7 +8247,11 @@ def process_full_text_with_gemini():
                     "error": "Gemini API key not configured"
                 }), 400
 
-        prompt_prefix = prompt_override or (config.get('gemini_prompt') or '').strip()
+        prompt_prefix = (
+            prompt_override
+            or (config.get('llm_prompt') or '').strip()
+            or (config.get('gemini_prompt') or '').strip()
+        )
 
         prompt_parts = []
         if prompt_prefix:
@@ -7859,6 +8315,18 @@ def process_gemini_speaker_profiles():
         prompt = compose_gemini_speaker_profile_prompt(prompt_prefix, speakers, context, processed_text)
         response_text = _run_llm_prompt(prompt, config)
         profiles = parse_gemini_speaker_table(response_text)
+        for profile in profiles.values():
+            profile_text = " ".join([
+                str(profile.get("name") or ""),
+                str(profile.get("description") or ""),
+                str(profile.get("voice") or ""),
+            ])
+            recommendations = recommend_voice_presets(profile_text, limit=3)
+            if recommendations:
+                profile["recommended_preset"] = recommendations[0]["id"]
+                profile["recommendation_confidence"] = recommendations[0]["confidence"]
+                profile["recommendation_reasons"] = recommendations[0]["reasons"]
+                profile["voice_recommendations"] = recommendations
 
         return jsonify({
             "success": True,
@@ -7943,7 +8411,11 @@ def process_gemini_section():
                     "error": "Gemini API key not configured"
                 }), 400
 
-        prompt_prefix = prompt_override or (config.get('gemini_prompt') or '').strip()
+        prompt_prefix = (
+            prompt_override
+            or (config.get('llm_prompt') or '').strip()
+            or (config.get('gemini_prompt') or '').strip()
+        )
 
         raw_known = data.get('known_speakers') or []
         known_speakers = []
@@ -7961,12 +8433,23 @@ def process_gemini_section():
             known_speakers
         )
         response_text = _run_llm_prompt(prompt, config)
+        recovered_text, fidelity_error, used_fallback = _recover_chinese_speaker_tags(
+            content,
+            response_text,
+        )
+        if recovered_text is None:
+            raise LocalLLMProcessorError(
+                f"Section failed source-text validation: {fidelity_error}. "
+                "No altered text was accepted; retry this section."
+            )
+        response_text = recovered_text
         detected_speakers = text_processor.extract_speakers(response_text)
 
         return jsonify({
             "success": True,
             "result_text": response_text.strip(),
-            "speakers": detected_speakers
+            "speakers": detected_speakers,
+            "used_fallback": used_fallback,
         })
 
     except (GeminiProcessorError, LocalLLMProcessorError, AtlasCloudProcessorError, OpenRouterProcessorError) as exc:
@@ -9334,7 +9817,10 @@ def _rebuild_review_manifest_from_chunks(job_id: str, job_dir: Path, force_rebui
                     "relative_file": rel_file,
                 }
                 # Carry over text/speaker/voice data from original if present
-                for field in ("speaker", "text", "engine", "emotion", "voice_assignment", "voice_label",
+                for field in ("speaker", "text", "engine", "emotion", "emotion_label",
+                              "emotion_source", "emotion_confidence", "emotion_reason",
+                              "emotion_driver",
+                              "voice_assignment", "voice_label",
                               "duration_seconds", "regenerated_at", "regen_status", "file_path"):
                     if field in orig:
                         record[field] = orig[field]
@@ -10313,6 +10799,9 @@ def health_check():
             CHATTERBOX_TURBO_UNAVAILABLE_REASON if not CHATTERBOX_TURBO_AVAILABLE else ""
         ),
         "qwen3_available": QWEN3_AVAILABLE,
+        "qwen3_mlx_available": QWEN3_MLX_AVAILABLE,
+        "qwen3_clone_available": QWEN3_CLONE_AVAILABLE,
+        "qwen3_voice_design_available": QWEN3_AVAILABLE,
         "omnivoice_available": OMNIVOICE_AVAILABLE,
         "pocket_tts_available": POCKET_TTS_AVAILABLE,
         "kitten_tts_available": KITTEN_TTS_AVAILABLE,
@@ -10346,19 +10835,70 @@ def qwen3_metadata():
     if not QWEN3_AVAILABLE:
         return jsonify({
             "success": False,
-            "error": "qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode."
+            "error": "Qwen3-TTS is unavailable. Install mlx-audio on Apple Silicon or qwen-tts on CUDA."
         }), 400
-    # Return static metadata - these are the actual Qwen3-TTS-CustomVoice supported speakers/languages
-    # Avoids loading the full model (~3-4GB GPU) just to get this list
+    config = load_config()
+    model_id = (config.get("qwen3_custom_model_id") or DEFAULT_QWEN3_CUSTOM_MODEL).strip()
+    uses_voice_design = "voicedesign" in model_id.replace("-", "").lower()
+    if uses_voice_design:
+        presets = list_voice_presets()
+        speakers = [preset["id"] for preset in presets]
+        speaker_labels = {
+            preset["id"]: preset["label"]
+            for preset in presets
+        }
+    else:
+        speakers = [
+            "aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"
+        ]
+        speaker_labels = {}
+    # Static metadata avoids loading the full model merely to populate controls.
     return jsonify({
         "success": True,
-        "speakers": [
-            "aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"
-        ],
+        "mode": "voice_design" if uses_voice_design else "custom_voice",
+        "speakers": speakers,
+        "speaker_labels": speaker_labels,
+        "presets": presets if uses_voice_design else [],
         "languages": [
             "auto", "english", "chinese", "japanese", "korean", "french", "german",
             "spanish", "italian", "portuguese", "russian"
         ],
+    })
+
+
+@app.route('/api/qwen3/voice-design/presets', methods=['GET'])
+def qwen3_voice_design_presets():
+    """Return Chinese-first, original character casting presets."""
+    return jsonify({
+        "success": True,
+        "default_text": CHINESE_SAMPLE_TEXT,
+        "presets": list_voice_presets(),
+        "acting_states": list_acting_states(),
+    })
+
+
+@app.route('/api/qwen3/voice-design/recommend', methods=['POST'])
+def qwen3_voice_design_recommend():
+    """Recommend original Mandarin archetypes for a novel character profile."""
+    payload = request.get_json(silent=True) or {}
+    profile = (payload.get("profile") or "").strip()
+    gender = (payload.get("gender") or "").strip() or None
+    try:
+        limit = int(payload.get("limit") or 3)
+    except (TypeError, ValueError):
+        limit = 3
+    if not profile:
+        return jsonify({
+            "success": False,
+            "error": "Character profile is required.",
+        }), 400
+    return jsonify({
+        "success": True,
+        "recommendations": recommend_voice_presets(
+            profile,
+            gender=gender,
+            limit=limit,
+        ),
     })
 
 
@@ -10367,7 +10907,10 @@ def qwen3_voice_design_preview():
     if not QWEN3_AVAILABLE:
         return jsonify({
             "success": False,
-            "error": "qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode."
+            "error": (
+                "Qwen3-TTS VoiceDesign is unavailable. Install mlx-audio on "
+                "Apple Silicon or qwen-tts on a CUDA machine."
+            )
         }), 400
     payload = request.get_json(silent=True) or {}
     text = (payload.get("text") or "").strip()
@@ -10383,7 +10926,10 @@ def qwen3_voice_design_save():
     if not QWEN3_AVAILABLE:
         return jsonify({
             "success": False,
-            "error": "qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode."
+            "error": (
+                "Qwen3-TTS VoiceDesign is unavailable. Install mlx-audio on "
+                "Apple Silicon or qwen-tts on a CUDA machine."
+            )
         }), 400
     payload = request.get_json(silent=True) or {}
     name = (payload.get("name") or "").strip()
@@ -10579,6 +11125,10 @@ if __name__ == '__main__':
     _cleanup_orphaned_chatterbox_voices()
     _auto_register_voice_prompt_files()
     _cleanup_orphaned_regen_folders()
+    server_port = int(os.environ.get("TTS_STORY_PORT", "5000"))
     if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-        threading.Timer(1.5, lambda: webbrowser.open("http://localhost:5000")).start()
-    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+        threading.Timer(
+            1.5,
+            lambda: webbrowser.open(f"http://localhost:{server_port}"),
+        ).start()
+    app.run(host='0.0.0.0', port=server_port, debug=True, use_reloader=False)

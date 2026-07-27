@@ -395,7 +395,7 @@ function formatEngineName(engine) {
         'voxcpm_local': 'VoxCPM 1.5',
         'pocket_tts': 'Pocket TTS (Clone Voices)',
         'pocket_tts_preset': 'Pocket TTS (Preset Voices)',
-        'qwen3_custom': 'Qwen3-TTS (Custom Voice)',
+        'qwen3_custom': 'Qwen3-TTS（中文角色声线）',
         'qwen3_clone': 'Qwen3-TTS (Voice Clone)',
         'omnivoice_clone': 'OmniVoice (Voice Clone)',
         'omnivoice_design': 'OmniVoice (Voice Design)',
@@ -1901,6 +1901,40 @@ function renderLibraryChunkRow(jobId, chunk, engine, idx) {
     const cacheToken = chunk.regenerated_at || chunk.relative_file || Date.now().toString();
     const audioUrl = fileUrl ? `${fileUrl}?t=${encodeURIComponent(cacheToken)}` : '';
     const regenStatus = chunk.regen_status || '';
+    const emotionLabels = {
+        neutral: '自然',
+        bright: '兴奋',
+        gentle: '温柔',
+        shy: '娇羞',
+        cold: '冷峻',
+        dangerous: '危险',
+        angry: '愤怒',
+        whisper: '低声',
+    };
+    const emotionSources = {
+        automatic: '自动',
+        manual: '手动',
+        continuity: '延续',
+        persona: '人设',
+    };
+    const emotionDrivers = {
+        semantic_text: '上下文导演 + 语义情绪',
+        vector: '固定情绪向量',
+    };
+    const emotionLabel = chunk.emotion_label || emotionLabels[chunk.emotion] || '';
+    const emotionSource = emotionSources[chunk.emotion_source] || '';
+    const emotionDriver = emotionDrivers[chunk.emotion_driver] || '';
+    const emotionTitle = [
+        emotionSource && `${emotionSource}判断`,
+        emotionDriver,
+        chunk.emotion_reason,
+        Number.isFinite(chunk.emotion_confidence)
+            ? `置信度 ${Math.round(chunk.emotion_confidence * 100)}%`
+            : '',
+    ].filter(Boolean).join(' · ');
+    const emotionBadge = emotionLabel
+        ? `<span class="library-chunk-emotion" title="${escapeHtml(emotionTitle)}">${escapeHtml(emotionLabel)}</span>`
+        : '';
 
     let statusBadge = '';
     if (regenStatus === 'queued') {
@@ -1926,11 +1960,13 @@ function renderLibraryChunkRow(jobId, chunk, engine, idx) {
                 <span class="chunk-expand-toggle">▶</span>
                 ${statusBadge}
                 ${speakerTag}
+                ${emotionBadge}
                 <span class="library-chunk-preview">${escapeHtml(textPreview)}</span>
             </div>
             <div class="library-chunk-details collapsed" data-chunk-id="${chunkId}">
                 <div class="chunk-detail-section">
                     <div class="chunk-detail-label">Voice: <span class="library-chunk-voice-label">${escapeHtml(voiceLabel)}</span></div>
+                    ${emotionLabel ? `<div class="chunk-detail-label">表演：${escapeHtml(emotionLabel)}${emotionSource ? ` · ${escapeHtml(emotionSource)}判断` : ''}</div>` : ''}
                     <div class="chunk-text-section">
                         <label>Text:</label>
                         <textarea class="library-chunk-textarea" data-chunk-id="${chunkId}" rows="3">${escapeHtml(text)}</textarea>
@@ -3173,7 +3209,7 @@ async function populateLibraryVoiceSelects(engine) {
             <option value="voxcpm_local">VoxCPM 1.5</option>
             <option value="pocket_tts">Pocket TTS · Clone Voices</option>
             <option value="pocket_tts_preset">Pocket TTS · Preset Voices</option>
-            <option value="qwen3_custom">Qwen3-TTS</option>
+            <option value="qwen3_custom">Qwen3-TTS · 中文角色声线</option>
             <option value="qwen3_clone">Qwen3-TTS · Voice Clone</option>
             <option value="omnivoice_clone">OmniVoice · Voice Clone</option>
             <option value="omnivoice_design">OmniVoice · Voice Design</option>
@@ -3316,7 +3352,7 @@ async function populateLibraryVoiceSelects(engine) {
             <option value="voxcpm_local">VoxCPM 1.5</option>
             <option value="pocket_tts">Pocket TTS · Clone Voices</option>
             <option value="pocket_tts_preset">Pocket TTS · Preset Voices</option>
-            <option value="qwen3_custom">Qwen3-TTS</option>
+            <option value="qwen3_custom">Qwen3-TTS · 中文角色声线</option>
             <option value="qwen3_clone">Qwen3-TTS · Voice Clone</option>
             <option value="omnivoice_clone">OmniVoice · Voice Clone</option>
             <option value="omnivoice_design">OmniVoice · Voice Design</option>
@@ -4270,7 +4306,7 @@ function _ensureLibraryAwrEntryModal() {
                                     <option value="voxcpm_local">VoxCPM 1.5</option>
                                     <option value="pocket_tts">Pocket TTS · Clone</option>
                                     <option value="pocket_tts_preset">Pocket TTS · Preset</option>
-                                    <option value="qwen3_custom">Qwen3-TTS · Custom Voice</option>
+                                    <option value="qwen3_custom">Qwen3-TTS · 中文角色声线</option>
                                     <option value="qwen3_clone">Qwen3-TTS · Clone</option>
                                     <option value="omnivoice_clone">OmniVoice · Clone</option>
                                     <option value="kitten_tts">KittenTTS</option>

@@ -1,6 +1,6 @@
 # Qwen3-TTS: Custom Voice, Clone, and Design
 
-TTS-Story uses three distinct Qwen3-TTS model modes. **CustomVoice** and **Voice Clone** are selectable job engines. **VoiceDesign** is used only from Voice Creation to make a preview that can be saved as a reusable reference prompt.
+TTS-Story uses three distinct Qwen3-TTS model modes. **CustomVoice** and **Voice Clone** are selectable job engines. In the Chinese-first Apple Silicon setup, the main Qwen job engine combines VoiceDesign and Base cloning automatically. It builds an adaptive emotion bank for each selected archetype and reuses those local references throughout the manuscript.
 
 ## Choose the correct mode
 
@@ -10,17 +10,18 @@ TTS-Story uses three distinct Qwen3-TTS model modes. **CustomVoice** and **Voice
 
 - **Qwen3 CustomVoice:** choose one of the speakers reported by the installed CustomVoice model and optionally describe delivery with an instruction such as “calm, warm narration.” This directs an existing identity; it does not invent a new speaker.
 - **Qwen3 Voice Clone:** condition the Base model with reference audio. TTS-Story can transcribe the prompt automatically with SenseVoice when no transcript is supplied.
-- **Qwen3 VoiceDesign:** describe a voice in [Voice Creation](help:voice-creation), generate a short local preview, and save that audio as a prompt. It is not a normal full-manuscript engine in the Generate list.
+- **Qwen3 VoiceDesign:** describe a voice in [Voice Creation](help:voice-creation), or select one of the 37 original Chinese presets in the main job workflow. For Chinese MLX jobs, the selected design is turned into a reusable local reference automatically; previewing and manual saving are optional.
 
 ## Requirements and setup
 
-The normal setup installs the Qwen TTS runtime. Each mode uses a separate 1.7B model by default, so selecting a new mode can trigger another multi-gigabyte download. A supported NVIDIA GPU is strongly recommended. CPU is selectable but can be impractically slow for long work.
+The normal setup installs the Qwen TTS runtime. Each mode uses a separate 1.7B model by default, so selecting a new mode can trigger another multi-gigabyte download. Apple Silicon uses the local MLX 8-bit builds; other platforms use the PyTorch models. A supported NVIDIA GPU is strongly recommended for the PyTorch path. CPU is selectable but can be impractically slow for long work.
 
 The defaults are:
 
-- `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
-- `Qwen/Qwen3-TTS-12Hz-1.7B-Base` for cloning
-- `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` for Voice Creation
+- Chinese-first Apple Silicon job engine and Voice Creation: `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit`
+- Optional built-in-speaker mode: `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`
+- Apple Silicon clone: `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit`
+- CUDA/PyTorch uses the corresponding `Qwen/Qwen3-TTS-12Hz-1.7B-*` models.
 
 Open [Settings → Engine Settings](app:settings/qwen3), leave Device at `auto`, and use the default model IDs unless deliberately testing a compatible replacement.
 
@@ -43,15 +44,33 @@ The speaker and language choices shown by TTS-Story are built-in compatibility l
 3. For Clone, use clean single-speaker audio and verify the automatic transcript. A transcript mismatch can reduce similarity or intelligibility.
 4. Start with 500-character chunks. Reduce the target if long sentences cause drift or memory pressure.
 5. Test dtype and attention changes with the same passage. A successful first sample is more important than the theoretically fastest setting.
-6. VoiceDesign results vary by prompt and seed behavior. Save only previews that have been auditioned with text similar to the intended project.
+6. Chinese MLX jobs automatically classify each line as neutral, bright, gentle, shy, cold, dangerous, angry, or whisper. Explicit emotion tags and per-character manual choices override automatic classification.
+7. Every emotional reference for a character shares the same identity seed and persona constraints. Emotion is directed through breath, emphasis, intensity, and rhythm rather than a different age, pitch base, or resonance. Weak adjacent lines inherit the previous state to avoid rapid switching.
+8. The bank is adaptive: neutral and the persona's default state are prepared first, while other states are generated only when the manuscript uses them. The first use of a new state is slower; later chunks and jobs reuse its cached reference.
+
+For Chinese novels, Voice Creation also provides 37 original casting
+archetypes and eight acting states. The presets are grouped by Honkai:
+Star Rail persona references, Genshin Impact persona references, and general
+audiobook narrators. Persona references help casting only: the instructions do
+not request an official character voice or clone a performer.
+
+Speaker profiles can be matched to these archetypes automatically. The matcher
+uses personality, age/gender direction, occupation, emotional contrast, and
+explicit persona references. Native Mandarin pacing is enforced across all
+presets. Direct VoiceDesign generation retries a grossly slow take once; the
+automatic identity-lock path uses the matching cached emotional reference for
+each manuscript chunk instead of redesigning a speaker on every chunk. The
+library's chunk review shows the chosen acting state, whether it was manual,
+automatic, inherited from the adjacent line, or the persona default, plus the
+decision confidence and cue.
 
 ## Time, privacy, and limitations
 
-The first use of each model can spend significant time downloading, loading, and warming GPU kernels. Switching among CustomVoice, Clone, and VoiceDesign can unload and load different weights. Later chunks are a better speed measurement than the first preview.
+The first Chinese identity-lock job downloads and loads both the VoiceDesign and Base 8-bit models. Creating a new persona adds reference-generation passes for neutral and its default state. Other acting states are added only when needed. Later chunks and later jobs using the same persona and state are a better speed measurement.
 
 After model downloads, synthesis, design, and automatic prompt transcription run locally. There is no provider usage fee and manuscript text is not submitted to a cloud TTS service.
 
-TTS-Story does not expose Qwen VoiceDesign as a regular job engine. CustomVoice instructions affect delivery but do not train a permanent identity. Supported languages and speakers depend on the installed model, and output quality can vary across languages.
+The automatic emotion bank is a generated local cache, not a trained multi-style speaker model. Shared identity seeds and persona constraints reduce within-book drift, but independently generated emotional references can still vary slightly and do not guarantee an exact official character or performer likeness. Exact real-person cloning still requires authorized source audio. Supported languages and speakers depend on the installed model, and output quality can vary across languages.
 
 ## Authoritative reference
 

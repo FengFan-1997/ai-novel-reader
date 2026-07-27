@@ -1,0 +1,53 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "cleanUrls": true,
+  "rewrites": [
+    {
+      "source": "/bridge/:path*",
+      "destination": "https://shengyue-relay.onrender.com/bridge/:path*"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "https://shengyue-relay.onrender.com/api/:path*"
+    },
+    {
+      "source": "/files/:path*",
+      "destination": "https://shengyue-relay.onrender.com/files/:path*"
+    },
+    {
+      "source": "/static/audio/:path*",
+      "destination": "https://shengyue-relay.onrender.com/static/audio/:path*"
+    },
+    {
+      "source": "/healthz",
+      "destination": "https://shengyue-relay.onrender.com/healthz"
+    },
+    {
+      "source": "/readyz",
+      "destination": "https://shengyue-relay.onrender.com/readyz"
+    },
+    {
+      "source": "/:path*",
+      "destination": "/index.html"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        }
+      ]
+    }
+  ]
+}

@@ -19,6 +19,9 @@ Job JSON schema:
         {
             "text":             "Hello world.",
             "spk_audio_prompt": "/abs/path/to/voice.wav",
+            "emo_vector":       [0, 0.8, 0, 0, 0.2, 0, 0, 0],
+            "emo_alpha":        0.6,
+            "use_random":       false,
             "output_path":      "/abs/path/to/chunk_0000.wav"
         },
         ...
@@ -56,6 +59,32 @@ _MODEL_REPO_MAP = {
     "IndexTTS-2":   "IndexTeam/IndexTTS-2",
     "IndexTTS-1.5": "IndexTeam/IndexTTS-1.5",
     "IndexTTS":     "IndexTeam/IndexTTS",
+}
+_EMOTION_VECTOR_KEYS = (
+    "happy",
+    "angry",
+    "sad",
+    "afraid",
+    "disgusted",
+    "melancholic",
+    "surprised",
+    "calm",
+)
+
+# The bundled semantic classifier only knows eight basic emotions. Composite
+# audiobook directions such as shy, cold, dangerous, gentle and whisper are
+# performance states rather than classifier labels. For those states the
+# context-aware director vector must remain the stronger signal, otherwise
+# "dangerous restraint" and "shy hesitation" are often misread as sadness.
+_SEMANTIC_BLEND_BY_STATE = {
+    "neutral": 0.70,
+    "bright": 0.75,
+    "angry": 0.75,
+    "gentle": 0.35,
+    "shy": 0.10,
+    "cold": 0.20,
+    "dangerous": 0.15,
+    "whisper": 0.15,
 }
 
 
@@ -119,10 +148,143 @@ def _infer_with_compatible_kwargs(tts, *, spk_audio_prompt: str, text: str, outp
         )
 
 
+def _build_generation_kwargs(
+    chunk: dict,
+    *,
+    num_beams: int,
+    diffusion_steps: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    max_mel_tokens: int,
+    max_text_tokens_per_segment: int,
+) -> dict:
+    """Build one deterministic IndexTTS2 request, including real emotion input."""
+    generation_kwargs = {
+        "num_beams": num_beams,
+        "diffusion_steps": diffusion_steps,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "repetition_penalty": repetition_penalty,
+        "max_mel_tokens": max_mel_tokens,
+        "max_text_tokens_per_segment": max_text_tokens_per_segment,
+    }
+    use_emotion_text = bool(chunk.get("use_emo_text"))
+    emotion_text = str(chunk.get("emo_text") or "").strip()
+    if use_emotion_text and emotion_text:
+        director_vector = chunk.get("emo_vector")
+        generation_kwargs.update(
+            {
+                "use_emo_text": True,
+                "emo_text": emotion_text,
+                "director_state": str(chunk.get("state") or "neutral"),
+                "director_vector": (
+                    [
+                        max(0.0, min(1.0, float(value)))
+                        for value in director_vector
+                    ]
+                    if isinstance(director_vector, list)
+                    and len(director_vector) == 8
+                    else None
+                ),
+                "emo_alpha": max(
+                    0.0,
+                    min(0.6, float(chunk.get("emo_alpha", 0.5))),
+                ),
+                "use_random": False,
+            }
+        )
+    else:
+        emotion_vector = chunk.get("emo_vector")
+        if not isinstance(emotion_vector, list) or len(emotion_vector) != 8:
+            return generation_kwargs
+        generation_kwargs.update(
+            {
+                "emo_vector": [
+                    max(0.0, min(1.0, float(value)))
+                    for value in emotion_vector
+                ],
+                "emo_alpha": max(
+                    0.0,
+                    min(0.6, float(chunk.get("emo_alpha", 0.5))),
+                ),
+                "use_random": bool(chunk.get("use_random", False)),
+            }
+        )
+    return generation_kwargs
+
+
+def _materialize_semantic_emotion(
+    tts,
+    generation_kwargs: dict,
+    *,
+    previous_vector: list[float] | None = None,
+    smoothing: float = 0.18,
+) -> tuple[dict, list[float] | None, dict | None]:
+    """Convert semantic emotion text to a vector and smooth same-speaker turns."""
+    if not generation_kwargs.get("use_emo_text"):
+        vector = generation_kwargs.get("emo_vector")
+        return (
+            generation_kwargs,
+            list(vector) if isinstance(vector, list) and len(vector) == 8 else None,
+            None,
+        )
+
+    emotion_text = str(generation_kwargs.pop("emo_text", "") or "").strip()
+    generation_kwargs.pop("use_emo_text", None)
+    director_state = str(generation_kwargs.pop("director_state", "neutral"))
+    director_vector = generation_kwargs.pop("director_vector", None)
+    if not emotion_text:
+        return generation_kwargs, None, None
+
+    detected = tts.qwen_emo.inference(emotion_text)
+    current = [
+        max(0.0, min(1.2, float(detected.get(key, 0.0))))
+        for key in _EMOTION_VECTOR_KEYS
+    ]
+    if isinstance(director_vector, list) and len(director_vector) == 8:
+        semantic_mix = _SEMANTIC_BLEND_BY_STATE.get(director_state, 0.50)
+        current = [
+            round(
+                semantic_mix * semantic
+                + (1.0 - semantic_mix) * max(0.0, min(1.0, float(directed))),
+                4,
+            )
+            for semantic, directed in zip(current, director_vector)
+        ]
+    if previous_vector and len(previous_vector) == 8:
+        mix = max(0.0, min(0.35, float(smoothing)))
+        current = [
+            round((1.0 - mix) * now + mix * before, 4)
+            for now, before in zip(current, previous_vector)
+        ]
+
+    # The bundled classifier normally returns a distribution, but malformed or
+    # ambiguous output can contain several full-strength emotions.  IndexTTS2
+    # subtracts the emotion-vector sum from the original speaker embedding, so
+    # a sum above 1 can invert that identity contribution and sound like a
+    # different actor. Preserve the mix while keeping a safe unit budget; the
+    # subsequent emo_alpha (capped at 0.6) controls performance intensity.
+    vector_sum = sum(current)
+    if vector_sum > 1.0:
+        current = [round(value / vector_sum, 4) for value in current]
+
+    generation_kwargs["emo_vector"] = current
+    generation_kwargs["use_random"] = False
+    return generation_kwargs, current, detected
+
+
 def _ensure_model(model_dir: str, model_version: str) -> None:
     """Download model weights from HuggingFace if not already present."""
-    gpt_path = os.path.join(model_dir, "gpt.pth")
-    if os.path.exists(gpt_path):
+    required_paths = (
+        os.path.join(model_dir, "config.yaml"),
+        os.path.join(model_dir, "gpt.pth"),
+        os.path.join(model_dir, "s2mel.pth"),
+        os.path.join(model_dir, "qwen0.6bemo4-merge", "model.safetensors"),
+    )
+    if all(os.path.isfile(path) for path in required_paths):
         return
 
     repo_id = _MODEL_REPO_MAP.get(model_version, "IndexTeam/IndexTTS-2")
@@ -131,12 +293,14 @@ def _ensure_model(model_dir: str, model_version: str) -> None:
         file=sys.stderr, flush=True,
     )
     print(
-        f"[worker] This is a one-time download (~2-4 GB). Please wait.",
+        f"[worker] This is a one-time download (~5.5 GB for IndexTTS2). Please wait.",
         file=sys.stderr, flush=True,
     )
 
     try:
-        from huggingface_hub import snapshot_download  # type: ignore
+        # The official helper detects restricted Hugging Face connectivity and
+        # switches to ModelScope when appropriate.
+        from indextts.utils.model_download import snapshot_download  # type: ignore
         snapshot_download(
             repo_id=repo_id,
             local_dir=model_dir,
@@ -262,6 +426,7 @@ def main() -> None:
         return
 
     files: list[str] = []
+    previous_emotion_by_prompt: dict[str, list[float]] = {}
     for chunk in chunks:
         text = chunk.get("text", "")
         spk_audio_prompt = chunk.get("spk_audio_prompt", "")
@@ -272,16 +437,44 @@ def main() -> None:
             continue
 
         try:
-            generation_kwargs = {
-                "num_beams": num_beams,
-                "diffusion_steps": diffusion_steps,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "repetition_penalty": repetition_penalty,
-                "max_mel_tokens": max_mel_tokens,
-                "max_text_tokens_per_segment": max_text_tokens_per_segment,
-            }
+            generation_kwargs = _build_generation_kwargs(
+                chunk,
+                num_beams=num_beams,
+                diffusion_steps=diffusion_steps,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                max_mel_tokens=max_mel_tokens,
+                max_text_tokens_per_segment=max_text_tokens_per_segment,
+            )
+            previous_vector = (
+                previous_emotion_by_prompt.get(spk_audio_prompt)
+                if bool(chunk.get("smooth_emotion"))
+                else None
+            )
+            generation_kwargs, resolved_vector, detected = (
+                _materialize_semantic_emotion(
+                    tts,
+                    generation_kwargs,
+                    previous_vector=previous_vector,
+                )
+            )
+            if resolved_vector is not None:
+                previous_emotion_by_prompt[spk_audio_prompt] = resolved_vector
+            if detected is not None:
+                print(
+                    "[EMOTION_DETECTED] "
+                    + json.dumps(
+                        {
+                            "scores": detected,
+                            "smoothed": bool(previous_vector),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
             _infer_with_compatible_kwargs(
                 tts,
                 spk_audio_prompt=spk_audio_prompt,

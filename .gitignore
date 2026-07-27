@@ -5,12 +5,15 @@ __pycache__/
 *.so
 .Python
 venv/
+.venv/
 venv.old/
 env/
 ENV/
 *.egg-info/
 dist/
 build/
+node_modules/
+cloud/web/dist/
 
 # Flask
 instance/
@@ -60,6 +63,7 @@ models/
 # Voice prompts (user data)
 data/voice_prompts/*
 !data/voice_prompts/.gitkeep
+data/voice_locks/
 
 # Job data (user-generated, not for repo)
 jobs.db

@@ -1462,6 +1462,14 @@ function applySettings(settings) {
     if (indexDefaultPrompt) {
         indexDefaultPrompt.value = settings.index_tts_default_prompt || '';
     }
+    const indexAutoEmotion = document.getElementById('index-tts-auto-emotion');
+    if (indexAutoEmotion) {
+        indexAutoEmotion.checked = settings.index_tts_auto_emotion !== false;
+    }
+    const indexEmotionStrength = document.getElementById('index-tts-emotion-strength');
+    if (indexEmotionStrength) {
+        indexEmotionStrength.value = settings.index_tts_emotion_strength ?? 1.0;
+    }
     const indexUseFp16 = document.getElementById('index-tts-use-fp16');
     if (indexUseFp16) {
         indexUseFp16.checked = settings.index_tts_use_fp16 !== false;
@@ -1777,6 +1785,11 @@ async function saveSettings() {
         index_tts_chunk_size: parseInt(document.getElementById('index-tts-chunk-size')?.value, 10) || 400,
         index_tts_device: document.getElementById('index-tts-device')?.value || 'auto',
         index_tts_default_prompt: document.getElementById('index-tts-default-prompt')?.value || '',
+        index_tts_auto_emotion: document.getElementById('index-tts-auto-emotion')?.checked ?? true,
+        index_tts_emotion_strength: (() => {
+            const parsed = parseFloat(document.getElementById('index-tts-emotion-strength')?.value);
+            return Number.isFinite(parsed) ? parsed : 1.0;
+        })(),
         index_tts_use_fp16: document.getElementById('index-tts-use-fp16')?.checked ?? true,
         index_tts_use_deepspeed: document.getElementById('index-tts-use-deepspeed')?.checked ?? false,
         index_tts_use_torch_compile: document.getElementById('index-tts-use-torch-compile')?.checked ?? false,
