@@ -1,12 +1,6 @@
-## ❤️ Thank You for Supporting Our Work
-
-We are deeply grateful to everyone who uses, shares, contributes to, and supports TTS-Story. Your encouragement helps us continue improving the project, adding new features, fixing problems, and keeping it freely available to the community.
-
-If you appreciate what we do and would like to support ongoing development, you can make a donation here:
-
-👉 **[Support TTS-Story and our other projects](https://xerophayze.com/store.html?category=patron+support)**
-
-Every contribution is appreciated. Thank you for helping make this work possible! 🙏
+> **Fork transparency notice**
+>
+> This repository is maintained by [FengFan-1997](https://github.com/FengFan-1997) and is based on the Apache-2.0 licensed open-source project [Xerophayze/TTS-Story](https://github.com/Xerophayze/TTS-Story). Upstream attribution and license notices are preserved. This fork's README does not publish third-party donation, sponsorship, or payment links.
 
 ---
 
