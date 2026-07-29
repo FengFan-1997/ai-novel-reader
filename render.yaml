@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: shengyue-relay
+    runtime: node
+    plan: free
+    region: virginia
+    rootDir: cloud/relay
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeployTrigger: "off"
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: CLOUD_ACCESS_PASSWORD
+        sync: false
+      - key: BRIDGE_SHARED_SECRET
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: PUBLIC_ORIGIN
+        value: https://shengyue-fengfan.vercel.app
+      # New public-library control plane.  Audio never passes through Render.
+      - key: DATABASE_URL
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_HOT_MAX_BYTES
+        value: "8589934592"
+      - key: COMMUNITY_ALLOWED_ORIGIN
+        value: https://shengyue-fengfan.vercel.app

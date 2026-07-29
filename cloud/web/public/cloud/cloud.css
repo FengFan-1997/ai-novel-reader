@@ -1,0 +1,182 @@
+.cloud-gate {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    color: #22221f;
+    background: rgba(246, 246, 243, 0.92);
+    backdrop-filter: blur(22px) saturate(150%);
+    transition: opacity 220ms ease, visibility 220ms ease;
+}
+
+.cloud-gate.cloud-online,
+.cloud-gate.cloud-gate-dismissed {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+.cloud-gate-card {
+    width: min(460px, 100%);
+    padding: 38px;
+    border: 1px solid #e1e0db;
+    border-radius: 24px;
+    background: #fff;
+    box-shadow: 0 26px 80px rgba(28, 28, 25, 0.14);
+    text-align: center;
+}
+
+.cloud-gate-brand {
+    width: 52px;
+    height: 52px;
+    margin: 0 auto 22px;
+    display: grid;
+    place-items: center;
+    border-radius: 15px;
+    color: #fff;
+    background: #252521;
+    font-family: "Songti SC", "STSong", serif;
+    font-size: 1.2rem;
+    font-weight: 700;
+}
+
+.cloud-gate-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: #85847e;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+}
+
+.cloud-gate-status i {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #d49a43;
+    box-shadow: 0 0 0 4px rgba(212, 154, 67, 0.12);
+}
+
+.cloud-auth .cloud-gate-status i {
+    background: #4d8de3;
+    box-shadow: 0 0 0 4px rgba(77, 141, 227, 0.12);
+}
+
+.cloud-maintenance .cloud-gate-status i {
+    background: #d8684e;
+    box-shadow: 0 0 0 4px rgba(216, 104, 78, 0.12);
+}
+
+.cloud-gate-card h1 {
+    margin: 11px 0 9px;
+    color: #22221f;
+    font-size: clamp(1.55rem, 5vw, 2rem);
+    letter-spacing: -0.04em;
+}
+
+.cloud-gate-card > p {
+    margin: 0 auto 24px;
+    color: #777670;
+    font-size: 0.88rem;
+    line-height: 1.75;
+}
+
+#cloud-login-form {
+    margin-top: 4px;
+    text-align: left;
+}
+
+#cloud-login-form label {
+    display: block;
+    margin-bottom: 7px;
+    color: #62615c;
+    font-size: 0.74rem;
+    font-weight: 650;
+}
+
+#cloud-login-form input {
+    width: 100%;
+    min-height: 44px;
+    padding: 10px 12px;
+    border: 1px solid #dcdad4;
+    border-radius: 11px;
+    color: #242421;
+    background: #fff;
+    font: inherit;
+}
+
+#cloud-login-form input:focus {
+    border-color: #8a8982;
+    outline: 3px solid rgba(34, 34, 31, 0.08);
+}
+
+#cloud-login-form button,
+.cloud-maintenance-actions button {
+    min-height: 42px;
+    padding: 9px 15px;
+    border: 1px solid #262622;
+    border-radius: 11px;
+    color: #fff;
+    background: #262622;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 700;
+}
+
+#cloud-login-form button {
+    width: 100%;
+    margin-top: 10px;
+}
+
+#cloud-login-form button:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+#cloud-login-error {
+    min-height: 18px;
+    margin-top: 7px;
+    display: block;
+    color: #c44e3a;
+    font-size: 0.7rem;
+    text-align: center;
+}
+
+.cloud-maintenance-actions {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+}
+
+.cloud-maintenance-actions .secondary {
+    color: #4f4e49;
+    border-color: #deddd8;
+    background: #fff;
+}
+
+.cloud-gate-card > small {
+    margin-top: 20px;
+    display: block;
+    color: #aaa9a3;
+    font-size: 0.68rem;
+    line-height: 1.55;
+}
+
+@media (max-width: 520px) {
+    .cloud-gate {
+        padding: 12px;
+    }
+
+    .cloud-gate-card {
+        padding: 30px 22px;
+        border-radius: 20px;
+    }
+
+    .cloud-maintenance-actions {
+        flex-direction: column;
+    }
+}

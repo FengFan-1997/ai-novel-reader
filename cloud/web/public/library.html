@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#111827" />
+    <meta name="description" content="声阅公共有声书库：由本地生成者共同保存和分发。" />
+    <title>声阅 · 公共书库</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&family=Noto+Serif+SC:wght@500;600;700;900&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/library.css?v=1" />
+  </head>
+  <body>
+    <a class="skip-link" href="#library-main">跳到书库内容</a>
+    <header class="site-header">
+      <a class="wordmark" href="/library" aria-label="声阅公共书库首页"><span>声</span><strong>声阅</strong><i>公共书库</i></a>
+      <nav aria-label="主导航"><a class="is-active" href="/library">发现</a><a href="/">本地工作台</a></nav>
+      <p class="ai-label">AI 合成有声内容</p>
+    </header>
+
+    <main id="library-main">
+      <section class="library-hero" aria-labelledby="hero-title">
+        <p class="eyebrow">社区共同保存</p>
+        <h1 id="hero-title">故事一旦被读出，<br><em>就不必再等待。</em></h1>
+        <p class="hero-copy">在你的电脑生成，在这里被更多人听见。热门章节由云端即时播放，冷门作品由在线贡献者继续接力。</p>
+        <form class="search-form" id="library-search" role="search">
+          <label class="sr-only" for="library-query">搜索书名或作者</label>
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m21 21-4.35-4.35m1.35-5.15a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0Z"/></svg>
+          <input id="library-query" type="search" autocomplete="off" placeholder="搜索书名、作者" />
+          <button type="submit">搜索</button>
+        </form>
+        <div class="source-key" aria-label="音频来源说明"><span><b class="source-dot cached"></b>云端可听</span><span><b class="source-dot peer"></b>社区节点</span><span><b class="source-dot wait"></b>等待上线</span></div>
+      </section>
+
+      <section class="library-section" aria-labelledby="library-title">
+        <div class="section-heading"><div><p class="eyebrow">正在流传</p><h2 id="library-title">公共书库</h2></div><p id="library-summary" aria-live="polite">正在寻找可以播放的故事…</p></div>
+        <div id="library-list" class="book-list" aria-live="polite" aria-busy="true"></div>
+      </section>
+    </main>
+
+    <dialog id="work-dialog" class="work-dialog" aria-labelledby="work-title">
+      <button class="dialog-close" type="button" data-close aria-label="关闭作品详情">×</button>
+      <div id="work-detail"></div>
+    </dialog>
+
+    <section id="player" class="player" hidden aria-label="音频播放器">
+      <div class="player-info"><span class="playing-mark" aria-hidden="true"></span><div><strong id="player-title">准备播放</strong><small id="player-subtitle">AI 合成有声内容</small></div></div>
+      <audio id="audio" controls preload="metadata"></audio>
+      <button type="button" id="close-player" aria-label="关闭播放器">×</button>
+    </section>
+    <script src="/library.js?v=1" defer></script>
+  </body>
+</html>
