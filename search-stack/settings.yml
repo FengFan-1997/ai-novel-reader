@@ -1,0 +1,42 @@
+use_default_settings:
+  engines:
+    # These engines are dedicated to unauthorized download indexes and are
+    # intentionally unavailable to the book discovery feature.
+    remove:
+      - z-library
+      - anna's archive
+      - library genesis
+
+general:
+  instance_name: "声阅本机搜索"
+  debug: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "local-placeholder-overridden-by-SEARXNG_SECRET"
+  limiter: false
+  image_proxy: true
+
+engines:
+  - name: baidu
+    disabled: false
+  - name: sogou
+    disabled: false
+  - name: quark
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: google
+    disabled: false
+  - name: brave
+    disabled: false

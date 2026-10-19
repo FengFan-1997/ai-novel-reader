@@ -9,7 +9,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
-import torch
+try:
+    import torch
+except ImportError:  # pragma: no cover - optional engine dependency
+    torch = None  # type: ignore[assignment]
 
 from .base import EngineCapabilities, TtsEngineBase, VoiceAssignment
 from ..audio_effects import AudioPostProcessor, VoiceFXSettings
@@ -24,6 +27,8 @@ def _setup_hint() -> str:
     return "Run setup.bat" if os.name == "nt" else "Run ./setup.sh"
 
 try:
+    if torch is None:
+        raise ImportError("PyTorch is not installed")
     from chatterbox.tts_turbo import ChatterboxTurboTTS  # type: ignore
     from huggingface_hub import snapshot_download  # type: ignore
 

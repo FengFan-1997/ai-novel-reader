@@ -9,7 +9,10 @@ import gc
 
 import numpy as np
 import soundfile as sf
-import torch
+try:
+    import torch
+except ImportError:  # pragma: no cover - optional engine dependency
+    torch = None  # type: ignore[assignment]
 
 from .base import EngineCapabilities, TtsEngineBase
 from ..audio_effects import AudioPostProcessor, VoiceFXSettings
@@ -18,6 +21,8 @@ from ..custom_voice_store import CUSTOM_CODE_PREFIX, get_custom_voice_by_code
 DEFAULT_SAMPLE_RATE = 24000
 
 try:
+    if torch is None:
+        raise ImportError("PyTorch is not installed")
     from kokoro import KPipeline  # type: ignore
     KOKORO_AVAILABLE = True
 except ImportError:  # pragma: no cover - handled upstream

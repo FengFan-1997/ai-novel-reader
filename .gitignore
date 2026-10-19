@@ -5,12 +5,15 @@ __pycache__/
 *.so
 .Python
 venv/
+.venv/
 venv.old/
 env/
 ENV/
 *.egg-info/
 dist/
 build/
+node_modules/
+cloud/web/dist/
 
 # Flask
 instance/
@@ -43,6 +46,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+!vendor/gutendex/gutendex/.env.template
 *.pem
 *.key
 *.p12
@@ -60,6 +64,7 @@ models/
 # Voice prompts (user data)
 data/voice_prompts/*
 !data/voice_prompts/.gitkeep
+data/voice_locks/
 
 # Job data (user-generated, not for repo)
 jobs.db
@@ -73,6 +78,7 @@ data/*.db
 # External voices cache
 data/external_voices/
 data/external_voices_cache.json
+data/rvc/
 
 # Personal sync scripts
 sync_to_repo.py

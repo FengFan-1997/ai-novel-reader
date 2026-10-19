@@ -195,7 +195,16 @@ class TextProcessor:
 
     @staticmethod
     def _split_into_sentences(text: str) -> List[str]:
-        pattern = re.compile(r'.*?(?:[.!?]+["\')\]]*(?=\s|$)|$)', re.DOTALL)
+        # Chinese sentence punctuation is normally followed immediately by the
+        # next character, while Latin full stops need a whitespace/end guard to
+        # avoid splitting decimals and abbreviations.
+        pattern = re.compile(
+            r'.*?(?:'
+            r'[。！？]+["\'”’」』）》】\)]*'
+            r'|[.!?]+["\'”’\)\]]*(?=\s|$)'
+            r'|$)',
+            re.DOTALL,
+        )
         return [match.group(0) for match in pattern.finditer(text) if match.group(0).strip()]
 
     def _smart_split_long_sentence(self, text: str) -> List[str]:
@@ -237,13 +246,13 @@ class TextProcessor:
         Search for the first sentence-ending punctuation at or after `start`.
         Returns the index just after the terminator, or None if not found.
         """
-        pattern = re.compile(r'[.!?]+["\')\]]*')
+        pattern = re.compile(r'(?:[。！？]+|[.!?]+)["\'”’」』）》】\)\]]*')
         match = pattern.search(text, start)
         return match.end() if match else None
 
     @staticmethod
     def _find_sentence_boundary_before_limit(text: str, limit: int) -> int:
-        pattern = re.compile(r'[.!?]+["\')\]]*')
+        pattern = re.compile(r'(?:[。！？]+|[.!?]+)["\'”’」』）》】\)\]]*')
         boundary_idx = None
         for match in pattern.finditer(text):
             if match.end() <= limit:
@@ -265,7 +274,7 @@ class TextProcessor:
     def _find_clause_boundary_before_limit(text: str, limit: int) -> int:
         window = text[:max(1, limit)]
         best_idx = None
-        for delimiter in ('\n\n', '\n', ';', ':', ',', '—', '-'):
+        for delimiter in ('\n\n', '\n', '；', ';', '：', ':', '，', ',', '、', '—', '-'):
             idx = window.rfind(delimiter)
             if idx > 0:
                 end_idx = idx + len(delimiter)

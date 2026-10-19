@@ -24,6 +24,9 @@ set "POCKET_TTS_VERSION=1.0.3"
 set "BLACKWELL_TORCH_VERSION=2.8.0"
 set "BLACKWELL_TORCHVISION_VERSION=0.23.0"
 set "BLACKWELL_TORCHAUDIO_VERSION=2.8.0"
+set "INDEX_TTS_REPO="
+for /f "usebackq delims=" %%R in (`powershell -NoLogo -NoProfile -Command "$m=Get-Content -Raw -LiteralPath '%~dp0model-assets.json' | ConvertFrom-Json; [Console]::Write($m.bootstrap.index_tts_repository)" 2^>nul`) do set "INDEX_TTS_REPO=%%R"
+if not defined INDEX_TTS_REPO set "INDEX_TTS_REPO=https://github.com/index-tts/index-tts.git"
 set "UPDATE_MODE=0"
 if /i "%~1"=="--update" set "UPDATE_MODE=1"
 if "%UPDATE_MODE%"=="1" echo Pinokio update mode enabled. Existing environments will be reused when valid.
@@ -501,7 +504,7 @@ where git >nul 2>&1
 if errorlevel 1 (
     echo WARNING: git not found. Skipping IndexTTS setup.
     echo To install IndexTTS manually:
-    echo   1. git clone https://github.com/index-tts/index-tts.git engines\index-tts
+    echo   1. git clone !INDEX_TTS_REPO! engines\index-tts
     echo   2. cd engines\index-tts ^&^& uv sync
     echo   3. Download model: uv run huggingface-cli download IndexTeam/IndexTTS-2 --local-dir=checkpoints
     goto :AfterIndexTTS
@@ -532,7 +535,7 @@ if not exist "%INDEX_TTS_DIR%\pyproject.toml" (
     echo Cloning IndexTTS repository ^(skipping LFS audio examples^)...
     set "INDEX_TTS_CLONE_TMP=%TEMP%\indextts_clone_%RANDOM%"
     set "GIT_LFS_SKIP_SMUDGE=1"
-    git clone https://github.com/index-tts/index-tts.git "!INDEX_TTS_CLONE_TMP!"
+    git clone "!INDEX_TTS_REPO!" "!INDEX_TTS_CLONE_TMP!"
     set "GIT_LFS_SKIP_SMUDGE=0"
     if not exist "!INDEX_TTS_CLONE_TMP!\pyproject.toml" (
         echo WARNING: Failed to clone IndexTTS ^(pyproject.toml missing^). Skipping IndexTTS setup.

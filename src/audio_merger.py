@@ -2,9 +2,11 @@
 Audio Merger - Combines audio chunks into single file
 """
 import logging
+import math
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from pydub import AudioSegment
@@ -232,9 +234,66 @@ class AudioMerger:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         list_file = output_path.with_suffix(".concat.txt")
+        normalization_dir = None
         try:
+            effective_files = list(input_files)
+            input_info = [sf.info(str(file_path)) for file_path in input_files]
+            sample_rates = {
+                int(info.samplerate)
+                for info in input_info
+                if int(info.samplerate or 0) > 0
+            }
+            channel_counts = {int(info.channels or 1) for info in input_info}
+            if len(sample_rates) > 1 or channel_counts != {1}:
+                # The concat demuxer assumes identical stream parameters. RVC
+                # emits 48 kHz while Qwen emits 24 kHz; concatenating those WAV
+                # packets directly corrupts timestamps and shortens the final
+                # chapter. Normalize only mixed inputs, one file at a time.
+                from scipy.signal import resample_poly
+
+                target_rate = max(sample_rates or {24000})
+                normalization_dir = tempfile.TemporaryDirectory(
+                    prefix=f"{output_path.stem}-normalized-",
+                    dir=str(output_path.parent),
+                )
+                effective_files = []
+                for index, (file_path, info) in enumerate(
+                    zip(input_files, input_info)
+                ):
+                    audio, source_rate = sf.read(
+                        str(file_path),
+                        dtype="float32",
+                        always_2d=True,
+                    )
+                    if audio.shape[1] > 1:
+                        audio = np.mean(audio, axis=1, keepdims=True)
+                    if int(source_rate) != target_rate:
+                        divisor = math.gcd(int(source_rate), target_rate)
+                        audio = resample_poly(
+                            audio,
+                            target_rate // divisor,
+                            int(source_rate) // divisor,
+                            axis=0,
+                        ).astype(np.float32)
+                    normalized_path = (
+                        Path(normalization_dir.name)
+                        / f"segment_{index:05d}.wav"
+                    )
+                    sf.write(
+                        str(normalized_path),
+                        audio.reshape(-1),
+                        target_rate,
+                        subtype="PCM_16",
+                    )
+                    effective_files.append(str(normalized_path))
+                logging.info(
+                    "Normalized %s mixed-rate inputs to %s Hz before merge",
+                    len(effective_files),
+                    target_rate,
+                )
+
             with list_file.open("w", encoding="utf-8") as handle:
-                for file_path in input_files:
+                for file_path in effective_files:
                     handle.write(f"file '{Path(file_path).as_posix()}'\n")
 
             codec_args = []
@@ -321,6 +380,8 @@ class AudioMerger:
                     list_file.unlink()
             except Exception:
                 pass
+            if normalization_dir is not None:
+                normalization_dir.cleanup()
         
     def merge_numpy_arrays(
         self,

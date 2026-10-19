@@ -337,7 +337,7 @@ class BundledHelpContentTests(unittest.TestCase):
         self.assertGreater(links_seen, 0, "The guide should contain navigable help: links")
 
     def test_all_internal_app_links_resolve_to_supported_locations(self) -> None:
-        template_source = (PROJECT_ROOT / "templates" / "index.html").read_text(
+        template_source = (PROJECT_ROOT / "templates" / "legacy.html").read_text(
             encoding="utf-8"
         )
         engine_tabs = {
@@ -380,7 +380,7 @@ class BundledHelpContentTests(unittest.TestCase):
                 self.assertIn(target, valid_targets)
 
     def test_help_shell_assets_and_single_initializer_are_wired(self) -> None:
-        template = (PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        template = (PROJECT_ROOT / "templates" / "legacy.html").read_text(encoding="utf-8")
         help_script = (PROJECT_ROOT / "static" / "js" / "help.js").read_text(encoding="utf-8")
         main_script = (PROJECT_ROOT / "static" / "js" / "main.js").read_text(encoding="utf-8")
         help_styles = (PROJECT_ROOT / "static" / "css" / "help.css").read_text(encoding="utf-8")
@@ -414,7 +414,7 @@ class BundledHelpContentTests(unittest.TestCase):
         self.assertNotIn('id="help-search-modal-overlay"', template)
 
     def test_alt_word_preview_offers_every_selectable_job_engine(self) -> None:
-        template = (PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        template = (PROJECT_ROOT / "templates" / "legacy.html").read_text(encoding="utf-8")
         select = re.search(
             r'<select\s+id="awr-preview-engine"[^>]*>(.*?)</select>',
             template,

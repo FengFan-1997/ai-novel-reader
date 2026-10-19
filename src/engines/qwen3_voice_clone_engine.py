@@ -6,13 +6,17 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 import soundfile as sf
-import torch
+try:
+    import torch
+except ImportError:  # pragma: no cover - optional engine dependency
+    torch = None  # type: ignore[assignment]
 
 from .base import EngineCapabilities, TtsEngineBase, VoiceAssignment
 from ..audio_effects import AudioPostProcessor, VoiceFXSettings
@@ -23,14 +27,33 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 try:
+    if torch is None:
+        raise ImportError("PyTorch is not installed")
     from huggingface_hub import snapshot_download
     from qwen_tts import Qwen3TTSModel  # type: ignore
 
-    QWEN3_AVAILABLE = True
+    QWEN3_PYTORCH_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional dependency
     Qwen3TTSModel = None  # type: ignore[assignment]
     snapshot_download = None  # type: ignore[assignment]
-    QWEN3_AVAILABLE = False
+    QWEN3_PYTORCH_AVAILABLE = False
+
+try:
+    from mlx_audio.tts.utils import load_model as load_mlx_model  # type: ignore
+
+    QWEN3_MLX_AVAILABLE = (
+        platform.system() == "Darwin" and platform.machine().lower() == "arm64"
+    )
+except ImportError:  # pragma: no cover - optional Apple Silicon dependency
+    load_mlx_model = None  # type: ignore[assignment]
+    QWEN3_MLX_AVAILABLE = False
+
+QWEN3_AVAILABLE = QWEN3_PYTORCH_AVAILABLE or QWEN3_MLX_AVAILABLE
+DEFAULT_QWEN3_CLONE_MODEL = (
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
+    if QWEN3_MLX_AVAILABLE
+    else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+)
 
 # Try to import SenseVoice for automatic transcription
 try:
@@ -55,7 +78,7 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
         self,
         *,
         device: str = "auto",
-        model_id: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        model_id: str = DEFAULT_QWEN3_CLONE_MODEL,
         dtype: str = "bfloat16",
         attn_implementation: str = "flash_attention_2",
         default_language: str = "Auto",
@@ -63,7 +86,36 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
         default_prompt_text: Optional[str] = None,
     ):
         if not QWEN3_AVAILABLE:
-            raise ImportError("qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode.")
+            raise ImportError(
+                "Qwen3-TTS is unavailable. Install mlx-audio on Apple Silicon "
+                "or qwen-tts on a CUDA machine."
+            )
+
+        wants_mlx = str(model_id).lower().startswith("mlx-community/")
+        apple_silicon = platform.system() == "Darwin" and platform.machine().lower() == "arm64"
+        self.backend = "mlx" if (wants_mlx or (apple_silicon and QWEN3_MLX_AVAILABLE)) else "pytorch"
+        if self.backend == "mlx":
+            if not QWEN3_MLX_AVAILABLE or load_mlx_model is None:
+                raise ImportError(
+                    "This Qwen3 voice-clone model requires Apple Silicon and mlx-audio."
+                )
+            if not wants_mlx:
+                model_id = DEFAULT_QWEN3_CLONE_MODEL
+            logger.info("Loading Qwen3 Voice Clone MLX model=%s", model_id)
+            self.model = load_mlx_model(model_id)
+            self.device = "mps"
+            self.model_id = model_id
+            self.default_language = default_language or "Chinese"
+            self.default_prompt = default_prompt
+            self.default_prompt_text = default_prompt_text
+            self.post_processor = AudioPostProcessor()
+            self._sample_rate = int(getattr(self.model, "sample_rate", 24000))
+            self._supported_languages = self._safe_supported_list("languages")
+            self._initialize_transcript_store()
+            return
+
+        if not QWEN3_PYTORCH_AVAILABLE or torch is None:
+            raise ImportError("qwen-tts and PyTorch are required for the CUDA Qwen3 backend.")
 
         resolved_device = self._resolve_device(device)
         if resolved_device.startswith("cuda") and torch.cuda.is_available():
@@ -97,10 +149,7 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
         self._sample_rate = None
         self._supported_languages = self._safe_supported_list("languages")
 
-        self._asr_model = None
-        self._transcript_cache: Dict[str, str] = {}
-        self._transcripts_file = Path(__file__).parent.parent.parent / "data" / "voice_prompts" / "transcripts.json"
-        self._load_persistent_transcripts()
+        self._initialize_transcript_store()
 
     @property
     def sample_rate(self) -> int:
@@ -132,19 +181,17 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
         try:
             prompt_text = self._transcribe_audio(prompt_path) if prompt_path else ""
             language = lang_code or self.default_language or "Auto"
-            wavs, sr = self.model.generate_voice_clone(
+            audio, sr = self._synthesize_clone(
                 text=text,
                 language=language,
-                ref_audio=prompt_path,
-                ref_text=prompt_text or "",
-                x_vector_only_mode=not bool(prompt_text),
+                prompt_path=prompt_path,
+                prompt_text=prompt_text or "",
             )
-            audio = np.asarray(wavs[0], dtype=np.float32)
             self._sample_rate = int(sr)
         finally:
             if temp_mp3_conv:
                 temp_mp3_conv.unlink(missing_ok=True)
-        return self.post_processor.apply_post_pipeline(audio, int(sr), None)
+        return self.post_processor.apply_post_pipeline(audio, int(sr), fx_settings)
 
     def generate_batch(
         self,
@@ -218,6 +265,7 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
             prompt_path = assignment.audio_prompt_path or self.default_prompt
             prompt_text = assignment.extra.get("prompt_text") or self.default_prompt_text
             fx_settings = VoiceFXSettings.from_payload(assignment.fx_payload)
+            temp_mp3_conv = None
 
             if prompt_path:
                 prompt_path = self._resolve_prompt_path(prompt_path)
@@ -241,13 +289,19 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
                     else:
                         fx_settings = None
 
-            x_vector_only_mode = False
             if not prompt_text:
-                logger.warning(
-                    "No transcript available for %s. Using x_vector_only_mode=True (quality may be reduced).",
-                    Path(prompt_path).name if prompt_path else "unknown",
-                )
-                x_vector_only_mode = True
+                if self.backend == "mlx":
+                    logger.warning(
+                        "No transcript is available for %s; MLX cloning will "
+                        "require one before synthesis.",
+                        Path(prompt_path).name if prompt_path else "unknown",
+                    )
+                else:
+                    logger.warning(
+                        "No transcript available for %s. Using "
+                        "x_vector_only_mode=True (quality may be reduced).",
+                        Path(prompt_path).name if prompt_path else "unknown",
+                    )
 
             logger.info(
                 "Qwen3 Voice Clone segment %s/%s speaker=%s language=%s prompt=%s",
@@ -262,14 +316,12 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
                 for chunk_idx, chunk_text in enumerate(chunks):
                     order_index = segment["_chunk_order_start"] + chunk_idx
                     output_path = output_dir / f"chunk_{order_index:04d}.wav"
-                    wavs, sr = self.model.generate_voice_clone(
+                    audio, sr = self._synthesize_clone(
                         text=chunk_text,
                         language=language or "Auto",
-                        ref_audio=prompt_path,
-                        ref_text=prompt_text or "",
-                        x_vector_only_mode=x_vector_only_mode,
+                        prompt_path=prompt_path,
+                        prompt_text=prompt_text or "",
                     )
-                    audio = np.asarray(wavs[0], dtype=np.float32)
                     self._sample_rate = int(sr)
                     audio = self.post_processor.apply_post_pipeline(audio, int(sr), fx_settings)
                     sf.write(str(output_path), audio, int(sr))
@@ -297,6 +349,50 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
 
         return [path for path in files if path]
 
+    def _synthesize_clone(
+        self,
+        *,
+        text: str,
+        language: str,
+        prompt_path: str,
+        prompt_text: str,
+    ) -> tuple[np.ndarray, int]:
+        if self.backend == "mlx":
+            if not prompt_text:
+                raise ValueError(
+                    "Qwen3 MLX voice cloning requires the exact transcript of "
+                    "the reference clip. Create the prompt with VoiceDesign or "
+                    "add its Chinese transcript when uploading."
+                )
+            results = list(self.model.generate(
+                text=text,
+                lang_code=(language or "chinese").lower(),
+                ref_audio=prompt_path,
+                ref_text=prompt_text,
+                verbose=False,
+            ))
+            if not results:
+                raise RuntimeError("Qwen3 MLX returned no audio.")
+            parts = [
+                np.asarray(result.audio, dtype=np.float32).reshape(-1)
+                for result in results
+            ]
+            audio = np.concatenate(parts) if len(parts) > 1 else parts[0]
+            sample_rate = int(
+                getattr(results[0], "sample_rate", None)
+                or getattr(self.model, "sample_rate", 24000)
+            )
+            return audio, sample_rate
+
+        wavs, sr = self.model.generate_voice_clone(
+            text=text,
+            language=language,
+            ref_audio=prompt_path,
+            ref_text=prompt_text,
+            x_vector_only_mode=not bool(prompt_text),
+        )
+        return np.asarray(wavs[0], dtype=np.float32), int(sr)
+
     def cleanup(self) -> None:  # pragma: no cover
         logger.info("Cleaning up Qwen3 Voice Clone engine resources")
         try:
@@ -312,7 +408,7 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
         except Exception:
             pass
         gc.collect()
-        if torch.cuda.is_available():
+        if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def _voice_assignment_for(self, voice_config: Dict[str, Dict], speaker: str) -> VoiceAssignment:
@@ -342,6 +438,17 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
         stat = path.stat()
         key_data = f"{path.name}:{stat.st_size}:{stat.st_mtime}"
         return hashlib.md5(key_data.encode()).hexdigest()[:16]
+
+    def _initialize_transcript_store(self) -> None:
+        self._asr_model = None
+        self._transcript_cache: Dict[str, str] = {}
+        self._transcripts_file = (
+            Path(__file__).parent.parent.parent
+            / "data"
+            / "voice_prompts"
+            / "transcripts.json"
+        )
+        self._load_persistent_transcripts()
 
     def _load_persistent_transcripts(self) -> None:
         if self._transcripts_file.exists():
@@ -457,6 +564,9 @@ class Qwen3VoiceCloneEngine(TtsEngineBase):
 
 
 __all__ = [
+    "DEFAULT_QWEN3_CLONE_MODEL",
     "Qwen3VoiceCloneEngine",
     "QWEN3_AVAILABLE",
+    "QWEN3_MLX_AVAILABLE",
+    "QWEN3_PYTORCH_AVAILABLE",
 ]

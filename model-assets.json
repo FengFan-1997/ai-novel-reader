@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "bootstrap": {
+    "ollama": {
+      "config_key": "llm_local_model",
+      "default_model": "qwen3:1.7b",
+      "source_url": "https://ollama.com/library/qwen3"
+    },
+    "index_tts_repository": "https://github.com/index-tts/index-tts.git"
+  },
+  "assets": [
+    {
+      "id": "qwen3_tts",
+      "provider": "Hugging Face Hub",
+      "config_keys": [
+        "qwen3_custom_model_id",
+        "qwen3_clone_model_id",
+        "qwen3_voice_design_model_id"
+      ],
+      "source_template": "https://huggingface.co/{model_id}",
+      "download": "huggingface_hub.snapshot_download when the engine is first loaded",
+      "local_path": "models/qwen3/",
+      "integrity": "Model repository revisions are resolved by Hugging Face Hub; this project does not pin a commit SHA-256."
+    },
+    {
+      "id": "ollama_character_analysis",
+      "provider": "Ollama Library",
+      "config_key": "llm_local_model",
+      "default_model": "qwen3:1.7b",
+      "source_url": "https://ollama.com/library/qwen3",
+      "download": "ollama pull <model>; invoked by the macOS setup script",
+      "integrity": "Downloaded and verified by Ollama; this project does not pin a manifest digest."
+    },
+    {
+      "id": "index_tts2",
+      "provider": "Hugging Face Hub",
+      "repository": "IndexTeam/IndexTTS-2",
+      "config_key": "index_tts_model_version",
+      "source_url": "https://huggingface.co/IndexTeam/IndexTTS-2",
+      "download": "IndexTTS worker snapshot_download on first use (worker reports approximately 5.5 GB)",
+      "local_path": "engines/index-tts/checkpoints/",
+      "integrity": "Hub metadata is used; this project does not pin a commit SHA-256."
+    },
+    {
+      "id": "yae_miko_rvc_community_model",
+      "provider": "Hugging Face Hub community repository",
+      "repository": "iroaK/RVC2_YaeMiko_GenshinImpact",
+      "source_url": "https://huggingface.co/iroaK/RVC2_YaeMiko_GenshinImpact",
+      "download_script": "scripts/setup-yae-rvc.sh",
+      "files": [
+        {
+          "name": "Yae_MikoJP.pth",
+          "url": "https://huggingface.co/iroaK/RVC2_YaeMiko_GenshinImpact/resolve/main/Yae_MikoJP.pth?download=true",
+          "sha256": null
+        },
+        {
+          "name": "Yae_MikoJP.index",
+          "url": "https://huggingface.co/iroaK/RVC2_YaeMiko_GenshinImpact/resolve/main/Yae_MikoJP.index?download=true",
+          "sha256": null
+        }
+      ],
+      "local_path": "data/rvc/yae_miko/",
+      "integrity": "No upstream SHA-256 is pinned; setup checks non-empty files and a minimum size only. Community voice/data rights require separate review."
+    }
+  ]
+}

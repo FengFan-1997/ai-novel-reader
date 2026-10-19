@@ -1149,7 +1149,9 @@ async function openJobDetailsModal(jobId) {
             body.innerHTML = `
                 <div class="job-detail-grid">
                     <div>
-                        <strong>Engine:</strong> ${job.engine || 'Unknown'}
+                        <strong>Engine:</strong> ${job.engine === 'qwen3_custom' && job.streaming_mode
+                            ? 'Qwen3-TTS · 流式多角色'
+                            : (job.engine || 'Unknown')}
                     </div>
                     <div>
                         <strong>Status:</strong> ${job.status || 'Unknown'}
@@ -1227,11 +1229,11 @@ function renderJobProgress(job) {
     const total = job.total_chunks || 0;
     const processed = Math.min(job.processed_chunks || 0, total || Infinity);
     const percent = total > 0 ? Math.round((processed / total) * 100) : (job.status === 'completed' ? 100 : 0);
-    const chunkLabel = total ? `${processed} / ${total} chunk${total === 1 ? '' : 's'}` : 'Estimating…';
+    const chunkLabel = total ? `${processed.toLocaleString()} / ${total.toLocaleString()} 段` : '正在计算片段数…';
     const etaLabel = formatEta(job.eta_seconds, job.status);
     const chapterLabel = job.chapter_mode
-        ? `${job.chapter_count || '?'} chapter${(job.chapter_count || 0) === 1 ? '' : 's'} (per chapter merge)`
-        : 'Single output file';
+        ? `${job.chapter_count || '?'} 章 · 分章归档`
+        : '单个音频文件';
     const postTotal = Number(job.post_process_total || 0);
     const postDone = Math.min(Number(job.post_process_done || 0), postTotal || Infinity);
     const postPercent = Number.isFinite(Number(job.post_process_percent))
@@ -1243,8 +1245,8 @@ function renderJobProgress(job) {
         && (job.eta_seconds === 0 || job.eta_seconds === null || typeof job.eta_seconds !== 'number');
     const showPost = (postTotal > 0 && (job.post_process_active || postDone > 0)) || isFinishing;
     const postLabel = postTotal > 0
-        ? `Post-processing ${postDone} / ${postTotal}`
-        : 'Post-processing…';
+        ? `后处理 ${postDone} / ${postTotal}`
+        : '正在后处理…';
     const postFillClass = postTotal > 0 ? 'progress-bar-fill' : 'progress-bar-fill indeterminate';
     const interruptedChip = job.status === 'interrupted'
         ? '<span class="review-chip warning">Interrupted</span>'
@@ -1264,7 +1266,7 @@ function renderJobProgress(job) {
             </div>
             <div class="queue-progress-footer">
                 <span>${chapterLabel}</span>
-                <span>${job.status === 'completed' ? 'Done' : job.status}</span>
+                <span>${job.status === 'completed' ? '已完成' : formatJobStatus(job.status)}</span>
             </div>
             ${interruptedChip || resumeHint ? `
                 <div class="queue-progress-footer">
@@ -1289,21 +1291,40 @@ function renderJobProgress(job) {
 
 function formatEta(seconds, status) {
     if (status === 'completed') {
-        return 'Done';
+        return '已完成';
     }
     if (seconds === 0) {
-        return 'Finishing up…';
+        return '即将进入归档…';
     }
     if (typeof seconds !== 'number' || seconds < 0 || Number.isNaN(seconds)) {
-        return 'Calculating…';
+        return '正在估算…';
     }
 
-    const minutes = Math.floor(seconds / 60);
-    const secs = Math.max(seconds % 60, 0);
-    if (minutes > 0) {
-        return `ETA ${minutes}m ${secs.toFixed(0)}s`;
+    const whole = Math.max(0, Math.round(seconds));
+    if (whole >= 48 * 3600) {
+        return `预计约 ${Math.round(whole / 86400)} 天`;
     }
-    return `ETA ${secs.toFixed(0)}s`;
+    if (whole >= 3600) {
+        return `预计约 ${Math.round(whole / 3600)} 小时`;
+    }
+    const minutes = Math.floor(whole / 60);
+    if (minutes > 0) {
+        return `预计 ${minutes} 分钟`;
+    }
+    return `预计 ${whole} 秒`;
+}
+
+function formatJobStatus(status) {
+    const labels = {
+        queued: '等待中',
+        processing: '正在合成',
+        pausing: '正在暂停',
+        paused: '已暂停',
+        interrupted: '可继续',
+        failed: '失败',
+        cancelled: '已取消',
+    };
+    return labels[status] || status || '未知状态';
 }
 
 async function cancelQueueJob(jobId) {

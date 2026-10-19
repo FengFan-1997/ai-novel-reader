@@ -1,7 +1,7 @@
 """
 TTS-Story - Web-based TTS application
 """
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 from flask_cors import CORS
 import base64
 import asyncio
@@ -16,6 +16,7 @@ import logging
 import math
 import mimetypes
 import os
+import platform
 import queue
 import re
 import shutil
@@ -49,8 +50,36 @@ from src.custom_voice_store import (
     replace_custom_voice,
     save_custom_voice,
 )
+from src.chinese_voice_director import (
+    CHINESE_SAMPLE_TEXT,
+    DEFAULT_CHINESE_SPEAKER_PROFILE_PROMPT,
+    PACING_RETRY_INSTRUCTION,
+    VOICE_PRESETS,
+    audit_streaming_cast,
+    build_streaming_voice_assignments,
+    compose_voice_instruction,
+    get_voice_preset,
+    has_abnormally_slow_delivery,
+    list_acting_states,
+    list_voice_presets,
+    recommend_voice_presets,
+    speaker_gender,
+)
+from src.chinese_character_analyzer import (
+    analyze_book_characters,
+    assign_character_voices,
+    extract_synopsis,
+    refine_characters_with_llm,
+    strip_speaker_tags,
+)
+from src.chinese_dialogue_tagger import (
+    tag_chinese_dialogue,
+    tag_chinese_dialogue_detailed,
+)
 from src.document_extractor import extract_text_from_file, get_supported_formats
+from src.book_search import create_book_search_blueprint
 from src.help_center import create_help_blueprint
+from src.site_assistant import create_site_assistant_blueprint
 from src.library_metadata import get_custom_chapter_title
 from src.atlas_cloud_processor import (
     AtlasCloudProcessor,
@@ -74,13 +103,20 @@ from src.local_llm_processor import (
 from src.replicate_api import ReplicateAPI
 from src.system_tools import find_system_tool
 from src.text_processor import TextProcessor
+from src.rvc_service import RVCService, project_conversion_seconds
+from src.streaming_store import StreamingStore, can_release_streaming_audio
+from src.community_library import CommunityLibraryClient
 from src.engines import TtsEngineBase
 from src.engines.chatterbox_turbo_local_engine import (
     CHATTERBOX_TURBO_AVAILABLE,
     CHATTERBOX_TURBO_UNAVAILABLE_REASON,
 )
 from src.engines.voxcpm_local_engine import VOXCPM_AVAILABLE
-from src.engines.qwen3_custom_voice_engine import QWEN3_AVAILABLE
+from src.engines.qwen3_custom_voice_engine import (
+    QWEN3_AVAILABLE,
+    QWEN3_MLX_AVAILABLE,
+    QWEN3_PYTORCH_AVAILABLE,
+)
 from src.engines.qwen3_voice_clone_engine import QWEN3_AVAILABLE as QWEN3_CLONE_AVAILABLE
 from src.engines.omnivoice_clone_engine import (
     OMNIVOICE_AVAILABLE,
@@ -156,6 +192,8 @@ logging.getLogger('werkzeug').setLevel(logging.WARNING)
 app = Flask(__name__)
 CORS(app)
 app.register_blueprint(create_help_blueprint())
+app.register_blueprint(create_book_search_blueprint(Path("data")))
+app.register_blueprint(create_site_assistant_blueprint(lambda: load_config()))
 
 # Configuration
 CONFIG_FILE = "config.json"
@@ -168,6 +206,9 @@ JOBS_ARCHIVE_DIR = JOBS_DATA_DIR / "archive"
 JOBS_DB_PATH = JOBS_DATA_DIR / "jobs.db"
 JOBS_DATA_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+streaming_store = StreamingStore(JOBS_DB_PATH)
+community_library = CommunityLibraryClient(Path("data"))
+rvc_service = RVCService(Path(__file__).resolve().parent)
 VOICE_PROMPT_DIR = Path("data/voice_prompts")
 VOICE_PROMPT_DIR.mkdir(parents=True, exist_ok=True)
 VOICE_PROMPT_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
@@ -176,8 +217,50 @@ EXTERNAL_VOICES_ARCHIVE_FILE = Path("data/external_voice_archives.json")
 PREP_PROGRESS_DIR = Path("data/prep")
 PREP_PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
 JOB_METADATA_FILENAME = "metadata.json"
+LIBRARY_TITLE_FILENAME = "library-title.json"
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
-DEFAULT_LLM_PROVIDER = "gemini"
+IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine().lower() == "arm64"
+DEFAULT_LLM_PROVIDER = "local"
+DEFAULT_QWEN3_CUSTOM_MODEL = (
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
+    if IS_APPLE_SILICON
+    else "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+)
+DEFAULT_QWEN3_CLONE_MODEL = (
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
+    if IS_APPLE_SILICON
+    else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+)
+DEFAULT_QWEN3_VOICE_DESIGN_MODEL = (
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
+    if IS_APPLE_SILICON
+    else "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+)
+DEFAULT_TTS_ENGINE = (
+    "index_tts"
+    if INDEX_TTS_AVAILABLE
+    else ("qwen3_custom" if IS_APPLE_SILICON else "kokoro")
+)
+DEFAULT_CHINESE_NOVEL_PROMPT = """你是一名中文有声书分镜编辑。把输入小说原文切分为旁白和人物对白，供多声线朗读。
+
+硬性规则：
+1. 保留原文每一个字，不改写、不润色、不概括、不增删剧情。
+2. 叙述、动作、心理、对白提示语、章节标题全部放入 [narrator]...[/narrator]。
+3. 引号内或明确的直接发言使用人物标签；同一行同时有提示语和对白时，必须按原文顺序拆成旁白块和人物块。
+4. 人物标签只能用小写英文字母、数字和连字符，最后一段必须是 male、female 或 neutral。根据当前原文自行生成标签，绝不能照抄本提示词中的词语当人物名。
+5. 没有说话的角色不能获得标签；无人回答、沉默、心理活动都属于旁白。
+6. 每段必须有完全匹配的开始和结束标签；标签外不允许出现任何文字。
+7. 每个标签块独占一行。不要输出解释、Markdown 代码框或思考过程。
+8. 明确有直接发言但说话者身份未知时，只能使用 [unknown-neutral]，不得猜测姓名。
+
+格式示范（只学习拆分方式；示例姓名和标签绝不能出现在正式输出；标点也必须原样保留）：
+输入：王强停下脚步，说：“走吧。”四周无人回应。
+输出：
+[narrator]王强停下脚步，说：[/narrator]
+[wang-qiang-male]“走吧。”[/wang-qiang-male]
+[narrator]四周无人回应。[/narrator]
+
+输出前自行核对：原文无遗漏；所有标签成对；旁白与对白归属正确。"""
 LIBRARY_CACHE_TTL = 5  # seconds
 MIN_CHATTERBOX_PROMPT_SECONDS = 5.0
 DEFAULT_CONFIG = {
@@ -198,8 +281,9 @@ DEFAULT_CONFIG = {
     "gemini_api_key": "",
     "gemini_model": DEFAULT_GEMINI_MODEL,
     "gemini_prompt": "",
+    "llm_prompt": DEFAULT_CHINESE_NOVEL_PROMPT,
     "gemini_prompt_presets": [],
-    "gemini_speaker_profile_prompt": "",
+    "gemini_speaker_profile_prompt": DEFAULT_CHINESE_SPEAKER_PROFILE_PROMPT,
     "llm_provider": DEFAULT_LLM_PROVIDER,
     "atlas_cloud_api_key": "",
     "atlas_cloud_base_url": DEFAULT_ATLAS_CLOUD_BASE_URL,
@@ -236,22 +320,22 @@ DEFAULT_CONFIG = {
     "elevenlabs_similarity_boost": 0.75,
     "elevenlabs_style": 0.0,
     "elevenlabs_use_speaker_boost": True,
-    "llm_local_provider": LLM_PROVIDER_LMSTUDIO,
-    "llm_local_base_url": DEFAULT_LOCAL_LLM_BASE_URLS[LLM_PROVIDER_LMSTUDIO],
-    "llm_local_model": "",
+    "llm_local_provider": LLM_PROVIDER_OLLAMA,
+    "llm_local_base_url": DEFAULT_LOCAL_LLM_BASE_URLS[LLM_PROVIDER_OLLAMA],
+    "llm_local_model": "qwen3:1.7b",
     "llm_local_api_key": "",
-    "llm_local_timeout": 120,
-    "llm_local_temperature": 0.2,
+    "llm_local_timeout": 600,
+    "llm_local_temperature": 0.1,
     "llm_local_top_p": 1.0,
     "llm_local_top_k": 0,
     "llm_local_repeat_penalty": 1.0,
-    "llm_local_max_tokens": 0,
-    "llm_local_disable_reasoning": False,
+    "llm_local_max_tokens": 8192,
+    "llm_local_disable_reasoning": True,
     "llm_gemini_chunk_size": 500,
     "llm_local_chunk_size": 500,
     "llm_gemini_chunk_chapters": True,
     "llm_local_chunk_chapters": True,
-    "tts_engine": "kokoro",
+    "tts_engine": DEFAULT_TTS_ENGINE,
     "chatterbox_turbo_local_default_prompt": "",
     "chatterbox_turbo_local_temperature": 0.8,
     "chatterbox_turbo_local_top_p": 0.95,
@@ -278,20 +362,45 @@ DEFAULT_CONFIG = {
     "voxcpm_local_inference_timesteps": 32,
     "voxcpm_local_normalize": True,  # Enable text normalization for numbers/abbreviations
     "voxcpm_local_denoise": False,
-    "qwen3_custom_model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "qwen3_custom_model_id": DEFAULT_QWEN3_CUSTOM_MODEL,
     "qwen3_custom_device": "auto",
     "qwen3_custom_dtype": "bfloat16",
     "qwen3_custom_attn_implementation": "flash_attention_2",
-    "qwen3_custom_default_language": "Auto",
-    "qwen3_custom_default_instruct": "",
-    "qwen3_clone_model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "qwen3_custom_default_language": "Chinese",
+    "qwen3_custom_default_instruct": "像日常聊天一样自然连贯地说，语速正常偏快，每秒约五个汉字。逗号只短暂停顿，句内不要断开，不要朗诵，不要拖长。",
+    "qwen3_custom_auto_voice_lock": True,
+    "qwen3_custom_clone_model_id": DEFAULT_QWEN3_CLONE_MODEL,
+    "qwen3_custom_stability_temperature": 0.35,
+    "qwen3_custom_stability_top_k": 20,
+    "qwen3_custom_stability_top_p": 0.9,
+    "qwen3_custom_stability_seed": 20260727,
+    "qwen3_clone_model_id": DEFAULT_QWEN3_CLONE_MODEL,
     "qwen3_clone_device": "auto",
     "qwen3_clone_dtype": "bfloat16",
     "qwen3_clone_attn_implementation": "flash_attention_2",
     "qwen3_clone_default_language": "Auto",
     "qwen3_clone_default_prompt": "",
     "qwen3_clone_default_prompt_text": "",
-    "qwen3_voice_design_model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    "qwen3_voice_design_model_id": DEFAULT_QWEN3_VOICE_DESIGN_MODEL,
+    "rvc_enabled": True,
+    "rvc_python_path": "",
+    "rvc_model_path": "",
+    "rvc_index_path": "",
+    "rvc_device": "cpu:0",
+    "rvc_pitch_method": "rmvpe",
+    "rvc_f0up_key": 0,
+    "rvc_index_rate": 0.5,
+    "rvc_filter_radius": 3,
+    "rvc_rms_mix_rate": 1.0,
+    "rvc_protect": 0.33,
+    "rvc_start_timeout": 120,
+    "rvc_conversion_timeout": 600,
+    "rvc_first_chapter_limit_minutes": 60,
+    "rvc_strict": False,
+    # Long local audiobook tasks can take days.  A machine restart should
+    # resume durable streaming work from SQLite instead of requiring the user
+    # to find and restart the job manually.
+    "streaming_auto_resume_after_restart": True,
     "pocket_tts_model_variant": "b6369a24",
     "pocket_tts_temp": 0.7,
     "pocket_tts_lsd_decode_steps": 1,
@@ -310,7 +419,7 @@ DEFAULT_CONFIG = {
     "index_tts_use_torch_compile": False,
     "index_tts_use_accel": False,
     "index_tts_num_beams": 1,
-    "index_tts_diffusion_steps": 12,
+    "index_tts_diffusion_steps": 25,
     "index_tts_temperature": 0.8,
     "index_tts_top_p": 0.8,
     "index_tts_top_k": 30,
@@ -320,6 +429,8 @@ DEFAULT_CONFIG = {
     "index_tts_device": "auto",
     "index_tts_default_prompt": "",
     "index_tts_chunk_size": 400,
+    "index_tts_auto_emotion": True,
+    "index_tts_emotion_strength": 1.0,
     "dots_tts_model_id": "rednote-hilab/dots.tts-soar",
     "dots_tts_precision": "auto",
     "dots_tts_optimize": False,
@@ -337,6 +448,13 @@ DEFAULT_CONFIG = {
     "parallel_chunks": 3,
     "group_chunks_by_speaker": False,
     "cleanup_vram_after_job": False,
+    # Public community library.  Disabled by default; once a user accepts the
+    # one-time notice, finished chapters are contributed in the background.
+    "community_shared_enabled": False,
+    "community_auto_contribute": False,
+    "community_api_url": os.environ.get("SHENGYUE_COMMUNITY_API_URL", ""),
+    "community_device_id": "",
+    "community_device_token": "",
 }
 
 SECRET_CONFIG_KEYS = {
@@ -348,6 +466,7 @@ SECRET_CONFIG_KEYS = {
     "chatterbox_turbo_replicate_api_token",
     "azure_speech_key",
     "elevenlabs_api_key",
+    "community_device_token",
 }
 
 POCKET_TTS_PRESET_VOICES = [
@@ -390,6 +509,12 @@ QWEN3_CUSTOM_SETTING_KEYS = {
     "qwen3_custom_attn_implementation",
     "qwen3_custom_default_language",
     "qwen3_custom_default_instruct",
+    "qwen3_custom_auto_voice_lock",
+    "qwen3_custom_clone_model_id",
+    "qwen3_custom_stability_temperature",
+    "qwen3_custom_stability_top_k",
+    "qwen3_custom_stability_top_p",
+    "qwen3_custom_stability_seed",
 }
 QWEN3_CLONE_SETTING_KEYS = {
     "qwen3_clone_model_id",
@@ -459,6 +584,12 @@ QWEN3_CUSTOM_OPTION_ALIASES = {
     "attn_implementation": "qwen3_custom_attn_implementation",
     "default_language": "qwen3_custom_default_language",
     "default_instruct": "qwen3_custom_default_instruct",
+    "auto_voice_lock": "qwen3_custom_auto_voice_lock",
+    "clone_model_id": "qwen3_custom_clone_model_id",
+    "stability_temperature": "qwen3_custom_stability_temperature",
+    "stability_top_k": "qwen3_custom_stability_top_k",
+    "stability_top_p": "qwen3_custom_stability_top_p",
+    "stability_seed": "qwen3_custom_stability_seed",
 }
 QWEN3_CLONE_OPTION_ALIASES = {
     "model": "qwen3_clone_model_id",
@@ -750,8 +881,9 @@ def _normalize_index_tts_options(options: Dict[str, Any]) -> Dict[str, Any]:
             continue
         key = str(raw_key).strip().lower()
         if key == "index_tts_model_version":
-            v = (value or "IndexTTS-2").strip()
-            result[key] = v if v in {"IndexTTS-2", "IndexTTS-1.5", "IndexTTS"} else "IndexTTS-2"
+            # This product path relies on IndexTTS2's disentangled emotion
+            # controls; older checkpoints cannot satisfy the contract.
+            result[key] = "IndexTTS-2"
         elif key == "index_tts_use_fp16":
             result[key] = _coerce_bool(value)
         elif key == "index_tts_use_deepspeed":
@@ -783,6 +915,11 @@ def _normalize_index_tts_options(options: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = (value or "").strip()
         elif key == "index_tts_chunk_size":
             result[key] = _coerce_int(value, minimum=100, maximum=1000, fallback=400)
+        elif key == "index_tts_auto_emotion":
+            result[key] = _coerce_bool(value)
+        elif key == "index_tts_emotion_strength":
+            raw_strength = 1.0 if value is None or value == "" else value
+            result[key] = max(0.0, min(1.0, float(raw_strength)))
     return result
 
 
@@ -971,9 +1108,33 @@ def _normalize_chatterbox_turbo_replicate_options(options: Dict[str, Any]) -> Di
 def _apply_engine_option_overrides(config: Dict[str, Any], engine_name: str, options: Optional[Dict[str, Any]]):
     overrides = _normalize_engine_options(engine_name, options or {})
     config.update(overrides)
-# Allow headings like [narrator]\nChapter 1 or Chapter 1 without tags.
+# Allow headings like [narrator]\nChapter 1 / 第一章 without tags.
+CHINESE_NUMERAL_PATTERN = r"0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟"
+CHINESE_HEADING_SPACE = r"[ \t\u3000]"
+CHINESE_BOOK_HEADING_REGEX = (
+    rf"(?:第{CHINESE_HEADING_SPACE}*[{CHINESE_NUMERAL_PATTERN}]+"
+    rf"{CHINESE_HEADING_SPACE}*(?:卷|部)"
+    rf"|(?:卷|部){CHINESE_HEADING_SPACE}*[{CHINESE_NUMERAL_PATTERN}]+)"
+    rf"(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?"
+    rf"{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+)
+CHINESE_SECTION_HEADING_REGEX = (
+    rf"(?:第{CHINESE_HEADING_SPACE}*[{CHINESE_NUMERAL_PATTERN}]+"
+    rf"{CHINESE_HEADING_SPACE}*(?:章|节|回|篇)"
+    rf"(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?"
+    rf"{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|序章(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|楔子(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|序言(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|前言(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|后记(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|尾声(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    rf"|番外(?:{CHINESE_HEADING_SPACE}*[：:、.\-—]?{CHINESE_HEADING_SPACE}*[^\n\r\[]*)?"
+    r"|〈[^〉\n\r]{1,80}〉)"
+)
 BOOK_HEADING_PATTERN = re.compile(
-    r'^\s*(?:\[[^\]]+\]\s*)*(book\b[^\n\r]*)$',
+    rf'^\s*(?:\[[^\]]+\]\s*)*((?:book\b[^\n\r]*?)|(?:{CHINESE_BOOK_HEADING_REGEX}))'
+    r'(?:\s*\[/[a-zA-Z0-9_\-]+\]\s*)*$',
     re.IGNORECASE | re.MULTILINE
 )
 
@@ -992,6 +1153,8 @@ SECTION_HEADING_KEYWORDS = [
     "appendix",
     "author note",
     "author's note",
+    "第…章", "第…节", "第…回", "第…篇",
+    "序章", "楔子", "序言", "前言", "后记", "尾声", "番外",
 ]
 
 def _parse_section_headings_from_db(custom_heading: Optional[str]) -> Optional[Any]:
@@ -1058,10 +1221,10 @@ def _build_section_heading_pattern(section_headings: Optional[Any] = None) -> re
     if section_headings is None and not keywords:
         keywords = list(SECTION_HEADING_KEYWORDS)
     keyword_regex = "|".join(filter(None, (_keyword_to_regex(word) for word in keywords)))
-    if not keyword_regex:
-        keyword_regex = "chapter"
+    english_pattern = rf"(?:{keyword_regex})\b[^\n\r]*" if keyword_regex else r"(?!)"
     return re.compile(
-        rf'^\s*(?:\[[^\]]+\]\s*)*(({keyword_regex})\b[^\n\r]*)$',
+        rf'^\s*(?:\[[^\]]+\]\s*)*((?:{english_pattern})|(?:{CHINESE_SECTION_HEADING_REGEX}))'
+        r'(?:\s*\[/[a-zA-Z0-9_\-]+\]\s*)*$',
         re.IGNORECASE | re.MULTILINE
     )
 
@@ -1100,6 +1263,7 @@ gpu_inference_lock = threading.Lock()
 chunk_regen_executor = ThreadPoolExecutor(max_workers=1)
 qwen3_voice_design_model = None
 qwen3_voice_design_signature = None
+qwen3_voice_design_backend = None
 library_cache = {
     "items": None,
     "timestamp": 0.0,
@@ -1345,7 +1509,7 @@ def _validate_voice_assignments_for_engine(
 
         if engine_name == "index_tts":
             default_prompt = (config.get("index_tts_default_prompt") or "").strip()
-            if not prompt and not default_prompt:
+            if not prompt and not default_prompt and not get_voice_preset(voice):
                 missing_prompts.append(speaker)
 
         if engine_name == "dots_tts":
@@ -1470,6 +1634,7 @@ def _perform_chunk_regeneration(
             "speaker": speaker,
             "text": regen_text,
             "chunks": [regen_text],
+            "emotion": chunk.get("emotion"),
         }]
         engine_name = _normalize_engine_name(config_snapshot.get("tts_engine"))
         
@@ -1692,6 +1857,8 @@ def _init_jobs_db() -> None:
             """
         )
         conn.commit()
+    streaming_store.init_schema()
+    streaming_store.recover_interrupted()
 
 
 def _job_text_dir(job_id: str) -> Path:
@@ -1707,6 +1874,13 @@ def _write_job_text(job_id: str, text: str) -> str:
     return str(text_path)
 
 
+def _write_job_source_text(job_id: str, text: str) -> str:
+    job_dir = _job_text_dir(job_id)
+    source_path = job_dir / "source.txt"
+    source_path.write_text(text or "", encoding="utf-8")
+    return str(source_path)
+
+
 def _load_job_text(text_path: Optional[str]) -> str:
     if not text_path:
         return ""
@@ -1720,7 +1894,29 @@ def _serialize_job_payload(job_entry: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(job_entry.get("job_payload") or {})
     if not isinstance(payload, dict):
         payload = {}
-    for key in ("timing_metrics", "started_at", "completed_at"):
+    for key in (
+        "timing_metrics",
+        "started_at",
+        "completed_at",
+        "job_type",
+        "streaming_mode",
+        "buffer_chapters",
+        "narrator_conversion",
+        "continue_full_book",
+        "streaming_warning",
+        "streaming_phase",
+        "rvc_auto_disabled",
+        "streaming_pipeline_version",
+        "source_text_path",
+        "batch_strategy",
+        "batch_window_segments",
+        "max_batch_size",
+        "cast_sampling",
+        "allow_multiple_protagonists",
+        "cast_analysis_complete",
+        "cast_audit",
+        "recast",
+    ):
         value = job_entry.get(key)
         if value is not None:
             payload[key] = value
@@ -1728,6 +1924,21 @@ def _serialize_job_payload(job_entry: Dict[str, Any]) -> Dict[str, Any]:
     if word_replacements is not None:
         payload["word_replacements"] = word_replacements
     return payload
+
+
+def _effective_job_engine(job_entry: Dict[str, Any]) -> Optional[str]:
+    """Report the engine that actually synthesizes this job's audio."""
+    payload = job_entry.get("job_payload") or {}
+    streaming_mode = job_entry.get("streaming_mode")
+    if streaming_mode is None and isinstance(payload, dict):
+        streaming_mode = payload.get("streaming_mode")
+    if streaming_mode:
+        # The streaming pipeline currently routes all synthesis through Qwen3,
+        # regardless of the global default configured for ordinary jobs.
+        return "qwen3_custom"
+    return job_entry.get("engine") or (
+        payload.get("engine") if isinstance(payload, dict) else None
+    )
 
 
 def _serialize_job_entry(job_id: str, job_entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -1739,7 +1950,7 @@ def _serialize_job_entry(job_id: str, job_entry: Dict[str, Any]) -> Dict[str, An
         "text_preview": job_entry.get("text_preview"),
         "text_path": job_entry.get("text_path"),
         "text_length": job_entry.get("text_length"),
-        "engine": job_entry.get("engine"),
+        "engine": _effective_job_engine(job_entry),
         "split_by_chapter": int(bool(job_entry.get("chapter_mode"))),
         "generate_full_story": int(bool(job_entry.get("full_story_requested"))),
         "review_mode": int(bool(job_entry.get("review_mode"))),
@@ -1886,9 +2097,41 @@ def _load_jobs_from_db() -> Dict[str, Dict[str, Any]]:
             "regen_tasks": {},
         }
         _extra = loaded[job_id]["job_payload"]
-        for key in ("timing_metrics", "started_at", "completed_at", "word_replacements"):
+        for key in (
+            "timing_metrics",
+            "started_at",
+            "completed_at",
+            "word_replacements",
+            "job_type",
+            "streaming_mode",
+            "buffer_chapters",
+            "narrator_conversion",
+            "continue_full_book",
+            "streaming_warning",
+            "streaming_phase",
+            "streaming_pipeline_version",
+            "source_text_path",
+            "batch_strategy",
+            "batch_window_segments",
+            "max_batch_size",
+            "cast_sampling",
+            "allow_multiple_protagonists",
+            "cast_analysis_complete",
+            "cast_audit",
+            "recast",
+        ):
             if key in _extra:
                 loaded[job_id][key] = _extra[key]
+        if (
+            int(loaded[job_id].get("streaming_pipeline_version") or 1) >= 3
+            and loaded[job_id].get("recast")
+            and "battle_friend" in str(loaded[job_id].get("streaming_warning") or "")
+        ):
+            # A V2 fallback warning is historical metadata, not a current V3
+            # problem. Keeping it visible after recast makes the task card look
+            # as though the rejected global crowd voice is still in use.
+            loaded[job_id]["streaming_warning"] = None
+            _extra.pop("streaming_warning", None)
     return loaded
 
 
@@ -1962,9 +2205,28 @@ def _build_job_payload(job_id: str, text: str, job_entry: Dict[str, Any]) -> Dic
         "custom_heading": json.dumps({"enabled_headings": job_entry.get("section_headings")}) if job_entry.get("section_headings") else None,
         "section_headings": job_entry.get("section_headings"),
         "total_chunks": job_entry.get("total_chunks"),
-        "engine": job_entry.get("engine"),
+        "engine": _effective_job_engine(job_entry),
         "word_replacements": job_entry.get("word_replacements") or [],
         "text_preview": (text or "")[:200],
+        "job_type": job_entry.get("job_type") or "audio",
+        "streaming_mode": bool(job_entry.get("streaming_mode")),
+        "buffer_chapters": int(job_entry.get("buffer_chapters") or 1),
+        "narrator_conversion": job_entry.get("narrator_conversion") or "none",
+        "continue_full_book": bool(job_entry.get("continue_full_book")),
+        "rvc_auto_disabled": bool(job_entry.get("rvc_auto_disabled")),
+        "streaming_pipeline_version": int(
+            job_entry.get("streaming_pipeline_version") or 1
+        ),
+        "source_text_path": job_entry.get("source_text_path"),
+        "batch_strategy": job_entry.get("batch_strategy") or "serial",
+        "batch_window_segments": int(
+            job_entry.get("batch_window_segments") or 12
+        ),
+        "max_batch_size": int(job_entry.get("max_batch_size") or 1),
+        "cast_sampling": job_entry.get("cast_sampling") or "none",
+        "allow_multiple_protagonists": bool(
+            job_entry.get("allow_multiple_protagonists")
+        ),
     }
 
 
@@ -1972,6 +2234,9 @@ def _build_job_data_from_entry(job_id: str, job_entry: Dict[str, Any]) -> Dict[s
     payload = job_entry.get("job_payload") or {}
     text_path = payload.get("text_path") or job_entry.get("text_path")
     text = _load_job_text(text_path)
+    source_text_path = payload.get("source_text_path") or job_entry.get(
+        "source_text_path"
+    )
     config = _hydrate_config_secrets(job_entry.get("config_snapshot") or load_config())
     return {
         "job_id": job_id,
@@ -1987,6 +2252,44 @@ def _build_job_data_from_entry(job_id: str, job_entry: Dict[str, Any]) -> Dict[s
         "section_headings": job_entry.get("section_headings"),
         "resume_from_chunk_index": job_entry.get("resume_from_chunk_index") or 0,
         "word_replacements": payload.get("word_replacements") or job_entry.get("word_replacements") or [],
+        "job_type": payload.get("job_type") or job_entry.get("job_type") or "audio",
+        "streaming_mode": bool(payload.get("streaming_mode") or job_entry.get("streaming_mode")),
+        "buffer_chapters": int(payload.get("buffer_chapters") or job_entry.get("buffer_chapters") or 1),
+        "narrator_conversion": payload.get("narrator_conversion") or job_entry.get("narrator_conversion") or "none",
+        "continue_full_book": bool(
+            payload.get("continue_full_book") or job_entry.get("continue_full_book")
+        ),
+        "rvc_auto_disabled": bool(
+            payload.get("rvc_auto_disabled") or job_entry.get("rvc_auto_disabled")
+        ),
+        "streaming_pipeline_version": int(
+            payload.get("streaming_pipeline_version")
+            or job_entry.get("streaming_pipeline_version")
+            or 1
+        ),
+        "source_text_path": source_text_path,
+        "source_text": _load_job_text(source_text_path),
+        "batch_strategy": payload.get("batch_strategy")
+        or job_entry.get("batch_strategy")
+        or "serial",
+        "batch_window_segments": int(
+            payload.get("batch_window_segments")
+            or job_entry.get("batch_window_segments")
+            or 12
+        ),
+        "max_batch_size": int(
+            payload.get("max_batch_size")
+            or job_entry.get("max_batch_size")
+            or 1
+        ),
+        "cast_sampling": payload.get("cast_sampling")
+        or job_entry.get("cast_sampling")
+        or "none",
+        "allow_multiple_protagonists": bool(
+            payload.get("allow_multiple_protagonists")
+            or job_entry.get("allow_multiple_protagonists")
+        ),
+        "cast_analysis_complete": bool(job_entry.get("cast_analysis_complete")),
     }
 
 
@@ -1998,6 +2301,21 @@ def _restore_jobs_from_db() -> None:
         for job_id, job_entry in jobs.items():
             status = job_entry.get("status")
             if status in {"processing", "queued", "pausing"}:
+                if job_entry.get("streaming_mode"):
+                    summary = streaming_store.summary(job_id)
+                    if (
+                        summary.get("chapter_count")
+                        and summary.get("ready_chapters") == summary.get("chapter_count")
+                    ):
+                        job_entry["status"] = "completed"
+                        job_entry["progress"] = 100
+                    elif summary.get("streamable_chapters"):
+                        job_entry["status"] = "buffered"
+                    else:
+                        job_entry["status"] = "interrupted"
+                        job_entry["interrupted_at"] = datetime.now().isoformat()
+                    job_entry["eta_seconds"] = None
+                    continue
                 if status == "processing":
                     # Check if the job actually finished — output files on disk mean it completed
                     job_dir_str = job_entry.get("job_dir")
@@ -2092,7 +2410,10 @@ def _ensure_qwen3_model(model_id: str) -> Path:
 
 
 def _qwen3_voice_design_signature(config: Dict[str, Any]) -> str:
-    model_id = (config.get("qwen3_voice_design_model_id") or "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign").strip()
+    model_id = (
+        config.get("qwen3_voice_design_model_id")
+        or DEFAULT_QWEN3_VOICE_DESIGN_MODEL
+    ).strip()
     device = (config.get("qwen3_custom_device") or "auto").strip()
     dtype = (config.get("qwen3_custom_dtype") or "bfloat16").strip()
     attn = (config.get("qwen3_custom_attn_implementation") or "flash_attention_2").strip()
@@ -2101,15 +2422,42 @@ def _qwen3_voice_design_signature(config: Dict[str, Any]) -> str:
 
 def _get_qwen3_voice_design_model(config: Dict[str, Any]):
     if not QWEN3_AVAILABLE:
-        raise ImportError("qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode.")
+        raise ImportError(
+            "Qwen3-TTS is unavailable. Install mlx-audio on Apple Silicon "
+            "or qwen-tts on a CUDA machine."
+        )
     global qwen3_voice_design_model, qwen3_voice_design_signature
+    global qwen3_voice_design_backend
     config = config or {}
     signature = _qwen3_voice_design_signature(config)
     with tts_engine_lock:
         if qwen3_voice_design_model is not None and qwen3_voice_design_signature == signature:
             return qwen3_voice_design_model
+
+        model_id = (
+            config.get("qwen3_voice_design_model_id")
+            or DEFAULT_QWEN3_VOICE_DESIGN_MODEL
+        ).strip()
+        wants_mlx = model_id.lower().startswith("mlx-community/")
+        if wants_mlx or (IS_APPLE_SILICON and QWEN3_MLX_AVAILABLE):
+            if not QWEN3_MLX_AVAILABLE:
+                raise ImportError(
+                    "The selected Qwen3 VoiceDesign model requires mlx-audio "
+                    "on Apple Silicon."
+                )
+            from mlx_audio.tts.utils import load_model as load_mlx_model
+
+            if not wants_mlx:
+                model_id = DEFAULT_QWEN3_VOICE_DESIGN_MODEL
+            logger.info("Loading Qwen3 VoiceDesign MLX model=%s", model_id)
+            qwen3_voice_design_model = load_mlx_model(model_id)
+            qwen3_voice_design_signature = signature
+            qwen3_voice_design_backend = "mlx"
+            return qwen3_voice_design_model
+
+        if not QWEN3_PYTORCH_AVAILABLE:
+            raise ImportError("qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode.")
         from qwen_tts import Qwen3TTSModel  # type: ignore
-        model_id = (config.get("qwen3_voice_design_model_id") or "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign").strip()
         device = _resolve_qwen_device(config.get("qwen3_custom_device") or "auto")
         dtype = _resolve_qwen_dtype(config.get("qwen3_custom_dtype") or "bfloat16")
         attn = _resolve_qwen_attn(config.get("qwen3_custom_attn_implementation") or "flash_attention_2")
@@ -2128,6 +2476,7 @@ def _get_qwen3_voice_design_model(config: Dict[str, Any]):
             attn_implementation=attn or None,
         )
         qwen3_voice_design_signature = signature
+        qwen3_voice_design_backend = "pytorch"
         return qwen3_voice_design_model
 
 
@@ -2178,6 +2527,12 @@ def _engine_signature(engine_name: str, config: Dict) -> str:
             (config.get("qwen3_custom_attn_implementation") or "").strip(),
             (config.get("qwen3_custom_default_language") or "").strip(),
             (config.get("qwen3_custom_default_instruct") or "").strip(),
+            str(bool(config.get("qwen3_custom_auto_voice_lock", True))),
+            (config.get("qwen3_custom_clone_model_id") or "").strip(),
+            str(config.get("qwen3_custom_stability_temperature")),
+            str(config.get("qwen3_custom_stability_top_k")),
+            str(config.get("qwen3_custom_stability_top_p")),
+            str(config.get("qwen3_custom_stability_seed")),
         )
         return f"{engine_name}::{'|'.join(parts)}"
     if engine_name == "qwen3_clone":
@@ -2361,26 +2716,44 @@ def _create_engine(engine_name: str, config: Dict) -> TtsEngineBase:
 
     if engine_name == "qwen3_custom":
         if not QWEN3_AVAILABLE:
-            raise ImportError("qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode.")
+            raise ImportError(
+                "Qwen3-TTS is unavailable. Install mlx-audio on Apple Silicon "
+                "or qwen-tts on a CUDA machine."
+            )
         device = (config.get("qwen3_custom_device") or "auto").strip()
         return get_engine(
             "qwen3_custom",
             device=device or "auto",
-            model_id=(config.get("qwen3_custom_model_id") or "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice").strip(),
+            model_id=(config.get("qwen3_custom_model_id") or DEFAULT_QWEN3_CUSTOM_MODEL).strip(),
             dtype=(config.get("qwen3_custom_dtype") or "bfloat16").strip(),
             attn_implementation=(config.get("qwen3_custom_attn_implementation") or "flash_attention_2").strip(),
             default_language=(config.get("qwen3_custom_default_language") or "Auto").strip() or "Auto",
             default_instruct=(config.get("qwen3_custom_default_instruct") or "").strip() or None,
+            auto_voice_lock=bool(config.get("qwen3_custom_auto_voice_lock", True)),
+            clone_model_id=(
+                config.get("qwen3_custom_clone_model_id")
+                or config.get("qwen3_clone_model_id")
+                or DEFAULT_QWEN3_CLONE_MODEL
+            ).strip(),
+            stability_temperature=float(
+                config.get("qwen3_custom_stability_temperature", 0.35)
+            ),
+            stability_top_k=int(config.get("qwen3_custom_stability_top_k", 20)),
+            stability_top_p=float(config.get("qwen3_custom_stability_top_p", 0.9)),
+            stability_seed=int(config.get("qwen3_custom_stability_seed", 20260727)),
         )
 
     if engine_name == "qwen3_clone":
         if not QWEN3_CLONE_AVAILABLE:
-            raise ImportError("qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode.")
+            raise ImportError(
+                "Qwen3-TTS voice cloning is unavailable. Install mlx-audio on "
+                "Apple Silicon or qwen-tts on a CUDA machine."
+            )
         device = (config.get("qwen3_clone_device") or "auto").strip()
         return get_engine(
             "qwen3_clone",
             device=device or "auto",
-            model_id=(config.get("qwen3_clone_model_id") or "Qwen/Qwen3-TTS-12Hz-1.7B-Base").strip(),
+            model_id=(config.get("qwen3_clone_model_id") or DEFAULT_QWEN3_CLONE_MODEL).strip(),
             dtype=(config.get("qwen3_clone_dtype") or "bfloat16").strip(),
             attn_implementation=(config.get("qwen3_clone_attn_implementation") or "flash_attention_2").strip(),
             default_language=(config.get("qwen3_clone_default_language") or "Auto").strip() or "Auto",
@@ -2483,7 +2856,7 @@ def _create_engine(engine_name: str, config: Dict) -> TtsEngineBase:
             use_torch_compile=bool(config.get("index_tts_use_torch_compile", False)),
             use_accel=bool(config.get("index_tts_use_accel", False)),
             num_beams=int(config.get("index_tts_num_beams", 1)),
-            diffusion_steps=int(config.get("index_tts_diffusion_steps", 12)),
+            diffusion_steps=int(config.get("index_tts_diffusion_steps", 25)),
             temperature=float(config.get("index_tts_temperature", 0.8)),
             top_p=float(config.get("index_tts_top_p", 0.8)),
             top_k=int(config.get("index_tts_top_k", 30)),
@@ -2492,6 +2865,26 @@ def _create_engine(engine_name: str, config: Dict) -> TtsEngineBase:
             max_text_tokens_per_segment=int(config.get("index_tts_max_text_tokens_per_segment", 120)),
             device=device,
             default_prompt=(config.get("index_tts_default_prompt") or "").strip() or None,
+            auto_emotion=bool(config.get("index_tts_auto_emotion", True)),
+            emotion_strength=float(config.get("index_tts_emotion_strength", 1.0)),
+            persona_design_model_id=(
+                config.get("qwen3_custom_model_id") or DEFAULT_QWEN3_CUSTOM_MODEL
+            ).strip(),
+            persona_clone_model_id=(
+                config.get("qwen3_custom_clone_model_id") or DEFAULT_QWEN3_CLONE_MODEL
+            ).strip(),
+            persona_stability_temperature=float(
+                config.get("qwen3_custom_stability_temperature", 0.35)
+            ),
+            persona_stability_top_k=int(
+                config.get("qwen3_custom_stability_top_k", 20)
+            ),
+            persona_stability_top_p=float(
+                config.get("qwen3_custom_stability_top_p", 0.9)
+            ),
+            persona_stability_seed=int(
+                config.get("qwen3_custom_stability_seed", 20260727)
+            ),
         )
 
     if engine_name == "azure_speech":
@@ -2777,7 +3170,7 @@ def slugify_filename(value: str, default: str = "chapter", max_length: int = 60)
     """Create a filesystem-friendly slug."""
     if not value:
         return default
-    value = re.sub(r'[^A-Za-z0-9]+', '-', value)
+    value = re.sub(r'[^\w]+', '-', value, flags=re.UNICODE)
     value = re.sub(r'-{2,}', '-', value).strip('-')
     if max_length and len(value) > max_length:
         value = value[:max_length].rstrip('-')
@@ -2890,16 +3283,27 @@ def split_text_into_book_sections(text: str, section_headings: Optional[Any] = N
         books = _build_sections_from_matches(text, book_matches, "Book")
         for idx, book in enumerate(books, start=1):
             book_content = book.get("content") or ""
-            section_matches = list(section_pattern.finditer(book_content))
+            # A book section includes its own heading at the beginning. Remove that
+            # wrapper before looking for chapters so the volume title does not turn
+            # into a synthetic "Title" chapter.
+            chapter_content = book_content
+            removed_prefix = 0
+            book_heading = (book.get("heading") or "").strip()
+            if book_heading and chapter_content.startswith(book_heading):
+                removed_prefix = len(book_heading)
+                chapter_content = chapter_content[removed_prefix:].lstrip()
+                removed_prefix = len(book_content) - len(chapter_content)
+
+            section_matches = list(section_pattern.finditer(chapter_content))
             if section_matches:
                 chapters = _build_sections_from_matches(
-                    book_content,
+                    chapter_content,
                     section_matches,
                     "Chapter",
-                    base_offset=book.get("heading_start") or 0
+                    base_offset=(book.get("heading_start") or 0) + removed_prefix
                 )
             else:
-                clean_content = book_content.strip()
+                clean_content = chapter_content.strip()
                 chapters = []
                 if clean_content:
                     chapters.append({"title": "Full Book", "content": clean_content})
@@ -2935,6 +3339,13 @@ def _resolve_llm_chunk_chapters(config: Dict[str, Any]) -> bool:
 
 
 def _chunk_text_by_paragraph_words(text: str, max_words: int) -> List[str]:
+    """Chunk Latin text by words and CJK text by characters.
+
+    Chinese novels normally contain no spaces, so ``str.split()`` reports an
+    entire paragraph as one word. The mixed unit count keeps the existing
+    English behavior while treating each CJK character as one model-budget
+    unit.
+    """
     content = (text or "").strip()
     if not content:
         return []
@@ -2952,31 +3363,162 @@ def _chunk_text_by_paragraph_words(text: str, max_words: int) -> List[str]:
     current_words = 0
 
     for paragraph in paragraphs:
-        paragraph_words = len(paragraph.split())
-        if not current_parts:
-            current_parts = [paragraph]
-            current_words = paragraph_words
-            continue
-
-        if current_words >= max_words:
-            chunks.append("\n\n".join(current_parts).strip())
-            current_parts = [paragraph]
-            current_words = paragraph_words
-            continue
-
-        if current_words + paragraph_words > max_words:
-            current_parts.append(paragraph)
-            chunks.append("\n\n".join(current_parts).strip())
-            current_parts = []
-            current_words = 0
-            continue
-
-        current_parts.append(paragraph)
-        current_words += paragraph_words
+        for paragraph_part in _split_text_by_reading_units(paragraph, max_words):
+            part_words = _count_reading_units(paragraph_part)
+            if current_parts and current_words + part_words > max_words:
+                chunks.append("\n\n".join(current_parts).strip())
+                current_parts = []
+                current_words = 0
+            current_parts.append(paragraph_part)
+            current_words += part_words
 
     if current_parts:
         chunks.append("\n\n".join(current_parts).strip())
     return chunks
+
+
+_CJK_CHAR_RE = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af]"
+)
+_READING_UNIT_RE = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af]"
+    r"|[A-Za-z0-9]+(?:['’_-][A-Za-z0-9]+)*"
+)
+_SENTENCE_END_CHARS = frozenset(".!?。！？；;")
+_CLAUSE_END_CHARS = frozenset(",，、:：—")
+
+
+def _count_reading_units(text: str) -> int:
+    """Estimate model input size across whitespace and non-whitespace scripts."""
+    return len(_READING_UNIT_RE.findall(text or ""))
+
+
+def _split_text_by_reading_units(text: str, max_units: int) -> List[str]:
+    """Split an oversized paragraph without cutting normal CJK sentences."""
+    content = (text or "").strip()
+    if not content or _count_reading_units(content) <= max_units:
+        return [content] if content else []
+
+    pieces: List[str] = []
+    start = 0
+    unit_count = 0
+    last_sentence_boundary: Optional[int] = None
+    last_clause_boundary: Optional[int] = None
+    in_latin_token = False
+
+    for idx, char in enumerate(content):
+        is_cjk = bool(_CJK_CHAR_RE.match(char))
+        is_latin_word = char.isascii() and (char.isalnum() or char in "_-'")
+        if is_cjk:
+            unit_count += 1
+            in_latin_token = False
+        elif is_latin_word:
+            if not in_latin_token:
+                unit_count += 1
+            in_latin_token = True
+        else:
+            in_latin_token = False
+
+        if char in _SENTENCE_END_CHARS:
+            last_sentence_boundary = idx + 1
+        elif char in _CLAUSE_END_CHARS or char.isspace():
+            last_clause_boundary = idx + 1
+
+        if unit_count < max_units:
+            continue
+
+        cut_at = last_sentence_boundary or last_clause_boundary or (idx + 1)
+        if cut_at <= start:
+            cut_at = idx + 1
+        piece = content[start:cut_at].strip()
+        if piece:
+            pieces.append(piece)
+        start = cut_at
+        unit_count = _count_reading_units(content[start:idx + 1])
+        last_sentence_boundary = None
+        last_clause_boundary = None
+        in_latin_token = bool(
+            idx + 1 < len(content)
+            and content[idx].isascii()
+            and (content[idx].isalnum() or content[idx] in "_-'")
+        )
+
+    remainder = content[start:].strip()
+    if remainder:
+        pieces.append(remainder)
+    return pieces
+
+
+_SPEAKER_BLOCK_RE = re.compile(
+    r"\[([a-zA-Z0-9_\-]+)\](.*?)\[/\1\]",
+    re.DOTALL,
+)
+_SPEAKER_TAG_RE = re.compile(r"\[/?[a-zA-Z0-9_\-]+\]")
+
+
+def _validate_llm_text_fidelity(source_text: str, tagged_text: str) -> Tuple[bool, str]:
+    """Verify that an LLM only inserted balanced speaker tags.
+
+    Whitespace between tag blocks is ignored because the formatter deliberately
+    puts each block on its own line. All non-whitespace source characters must
+    remain byte-for-byte identical and in the same order.
+    """
+    output = (tagged_text or "").strip()
+    matches = list(_SPEAKER_BLOCK_RE.finditer(output))
+    if not matches:
+        return False, "LLM output contains no balanced speaker blocks"
+
+    cursor = 0
+    payload_parts: List[str] = []
+    for match in matches:
+        if output[cursor:match.start()].strip():
+            return False, "LLM output contains text outside speaker tags"
+        payload_parts.append(match.group(2))
+        cursor = match.end()
+    if output[cursor:].strip():
+        return False, "LLM output contains text outside speaker tags"
+
+    source_plain = _SPEAKER_TAG_RE.sub("", source_text or "")
+    output_plain = "".join(payload_parts)
+    source_compact = re.sub(r"\s+", "", source_plain)
+    output_compact = re.sub(r"\s+", "", output_plain)
+    if source_compact != output_compact:
+        return False, "LLM changed, omitted, duplicated, or reordered source text"
+    return True, ""
+
+
+def _recover_chinese_speaker_tags(
+    source_text: str,
+    llm_text: str,
+) -> Tuple[Optional[str], str, bool]:
+    """Validate LLM tags and fall back to deterministic Chinese dialogue tags.
+
+    The fallback is used only when the source contains supported Chinese
+    quotation marks.  It never rewrites source characters, so a small local LLM
+    can fail safely without turning the UI action into a dead end.
+    """
+    is_faithful, fidelity_error = _validate_llm_text_fidelity(source_text, llm_text)
+    if is_faithful:
+        return llm_text, "", False
+
+    fallback_text = tag_chinese_dialogue(source_text)
+    if fallback_text:
+        fallback_is_faithful, fallback_error = _validate_llm_text_fidelity(
+            source_text,
+            fallback_text,
+        )
+        if fallback_is_faithful:
+            logger.warning(
+                "LLM speaker tagging failed fidelity validation; "
+                "used deterministic Chinese dialogue fallback: %s",
+                fidelity_error,
+            )
+            return fallback_text, fidelity_error, True
+        fidelity_error = f"{fidelity_error}; fallback failed: {fallback_error}"
+
+    return None, fidelity_error, False
 
 
 def _append_llm_chunks(
@@ -3421,6 +3963,25 @@ def load_job_metadata(job_dir: Path):
     return None
 
 
+def load_library_title(job_dir: Path, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Load a user-facing book title that streaming progress updates cannot erase."""
+    title_path = job_dir / LIBRARY_TITLE_FILENAME
+    if title_path.exists():
+        try:
+            with title_path.open("r", encoding="utf-8") as handle:
+                stored = json.load(handle)
+            title = str(stored.get("title") or "").strip()
+            if title:
+                return title
+        except Exception as err:
+            logger.warning("Failed to load library title from %s: %s", title_path, err)
+    source = metadata or {}
+    return (
+        str(source.get("collection_title") or source.get("audiobook_title") or "").strip()
+        or None
+    )
+
+
 def handle_remove_readonly(func, path, exc_info):
     """Handle read-only files on Windows when deleting directories"""
     try:
@@ -3478,6 +4039,8 @@ def process_job_worker():
                 job_type = job_data.get('job_type') or 'audio'
                 if job_type == 'audio':
                     process_audio_job(job_data)
+                elif job_type == 'streaming_audio':
+                    process_streaming_audio_job(job_data)
                 elif job_type == 'qwen3_voice_design_preview':
                     process_qwen3_voice_design_preview_task(job_data)
                 elif job_type == 'qwen3_voice_design_save':
@@ -3493,13 +4056,13 @@ def process_job_worker():
                 with queue_lock:
                     jobs[job_id]['status'] = 'failed'
                     jobs[job_id]['error'] = str(e)
-            
+
             # Clear current job
             with queue_lock:
                 current_job_id = None
-            
+
             job_queue.task_done()
-            
+
         except queue.Empty:
             continue
         except Exception as e:
@@ -3525,6 +4088,1898 @@ def _apply_word_replacements(text: str, replacements: list) -> str:
     return text
 
 
+def _streaming_section_layout(
+    text: str,
+    section_headings: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """Flatten the existing book/chapter detector into a playback sequence."""
+    hierarchy = split_text_into_book_sections(text, section_headings)
+    sections: List[Dict[str, Any]] = []
+    if hierarchy.get("kind") == "book":
+        for book in hierarchy.get("books") or []:
+            for chapter in book.get("chapters") or []:
+                sections.append(
+                    {
+                        "title": chapter.get("title") or book.get("title") or "正文",
+                        "content": chapter.get("content") or "",
+                    }
+                )
+    else:
+        sections = [
+            {
+                "title": section.get("title") or "正文",
+                "content": section.get("content") or "",
+            }
+            for section in (hierarchy.get("sections") or [])
+        ]
+    if not sections:
+        sections = [{"title": "正文", "content": text}]
+    source_cursor = 0
+    for index, section in enumerate(sections):
+        section["index"] = index
+        content = str(section.get("content") or "")
+        source_start = str(text or "").find(content, source_cursor) if content else source_cursor
+        if source_start < 0:
+            source_start = str(text or "").find(content) if content else source_cursor
+        if source_start < 0:
+            source_start = source_cursor
+        section["source_start"] = source_start
+        section["source_end"] = source_start + len(content)
+        source_cursor = section["source_end"]
+    return sections
+
+
+def _flatten_streaming_segments(
+    processor: TextProcessor,
+    text: str,
+    word_replacements: List[Dict[str, str]],
+    *,
+    source_text: Optional[str] = None,
+    source_base: int = 0,
+    attributions: Optional[List[Dict[str, Any]]] = None,
+    chapter_index: Optional[int] = None,
+    generation_version: int = 2,
+) -> List[Dict[str, Any]]:
+    flattened: List[Dict[str, Any]] = []
+    attribution_rows = list(attributions or [])
+    attribution_cursor = 0
+    compact_source = ""
+    compact_positions: List[int] = []
+    for position, character in enumerate(str(source_text or "")):
+        if character.isspace():
+            continue
+        compact_source += character
+        compact_positions.append(position)
+    compact_cursor = 0
+
+    def locate_source(chunk_text: str) -> Tuple[Optional[int], Optional[int]]:
+        nonlocal compact_cursor
+        compact_chunk = "".join(
+            character for character in str(chunk_text or "") if not character.isspace()
+        )
+        if not compact_chunk or not compact_source:
+            return None, None
+        compact_index = compact_source.find(compact_chunk, compact_cursor)
+        if compact_index < 0:
+            compact_index = compact_source.find(compact_chunk)
+        if compact_index < 0:
+            return None, None
+        compact_cursor = compact_index + len(compact_chunk)
+        start = compact_positions[compact_index]
+        end_position = compact_index + len(compact_chunk) - 1
+        end = compact_positions[min(end_position, len(compact_positions) - 1)] + 1
+        return source_base + start, source_base + end
+
+    for segment in processor.process_text(text):
+        speaker = str(segment.get("speaker") or "default").strip().lower()
+        for chunk_text in segment.get("chunks") or []:
+            rendered_text = (
+                _apply_word_replacements(chunk_text, word_replacements)
+                if word_replacements
+                else chunk_text
+            )
+            attribution = None
+            if (
+                speaker != "narrator"
+                and attribution_cursor < len(attribution_rows)
+            ):
+                for candidate_index in range(
+                    attribution_cursor,
+                    min(len(attribution_rows), attribution_cursor + 4),
+                ):
+                    candidate = attribution_rows[candidate_index]
+                    if str(candidate.get("speaker") or "").lower() == speaker:
+                        attribution = candidate
+                        attribution_cursor = candidate_index + 1
+                        break
+            if attribution:
+                source_start = source_base + int(attribution.get("source_start") or 0)
+                source_end = source_base + int(attribution.get("source_end") or 0)
+            else:
+                source_start, source_end = locate_source(chunk_text)
+            flattened.append(
+                {
+                    "chapter_index": chapter_index,
+                    "segment_index": len(flattened),
+                    "speaker": speaker,
+                    "character_id": (
+                        str(attribution.get("character_id"))
+                        if attribution and attribution.get("character_id")
+                        else (speaker if speaker.startswith("character-") else None)
+                    ),
+                    "gender": (
+                        str(attribution.get("gender") or "neutral")
+                        if attribution
+                        else speaker_gender(speaker)
+                    ),
+                    "emotion": segment.get("emotion"),
+                    "text": rendered_text,
+                    "source_start": source_start,
+                    "source_end": source_end,
+                    "attribution_label": (
+                        attribution.get("label") if attribution else None
+                    ),
+                    "attribution_source": (
+                        attribution.get("source")
+                        if attribution
+                        else ("narration" if speaker == "narrator" else "existing_tag")
+                    ),
+                    "attribution_confidence": float(
+                        attribution.get("confidence") if attribution else 1.0
+                    ),
+                    "scene_id": attribution.get("scene_id") if attribution else None,
+                    "speaker_role": (
+                        attribution.get("speaker_role")
+                        if attribution
+                        else ("narrator" if speaker == "narrator" else "tagged")
+                    ),
+                    "content_hash": hashlib.sha256(
+                        "".join(str(rendered_text or "").split()).encode("utf-8")
+                    ).hexdigest(),
+                    "generation_version": int(generation_version),
+                    "inference_evidence": (
+                        attribution.get("evidence") if attribution else {}
+                    ),
+                }
+            )
+    return flattened
+
+
+def _audio_file_duration(path: Path) -> float:
+    try:
+        info = sf.info(str(path))
+        return float(info.frames / info.samplerate) if info.samplerate else 0.0
+    except Exception:
+        return 0.0
+
+
+def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
+    with partial.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(partial, path)
+
+
+def _publish_streaming_metadata(
+    job_id: str,
+    job_dir: Path,
+    *,
+    output_format: str,
+    full_story: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    chapters = []
+    for row in streaming_store.list_chapters(job_id, include_segments=False):
+        relative_path = row.get("relative_path")
+        if row.get("state") != "ready" or not relative_path:
+            continue
+        chapters.append(
+            {
+                "index": int(row["chapter_index"]) + 1,
+                "title": row["title"],
+                "file_url": _chunk_file_url(job_id, relative_path),
+                "relative_path": relative_path,
+                "duration_seconds": row.get("duration_seconds") or 0,
+                "streaming_state": "ready",
+            }
+        )
+    metadata = {
+        **(load_job_metadata(job_dir) or {}),
+        "job_id": job_id,
+        "streaming_mode": True,
+        "chapter_mode": True,
+        "book_mode": False,
+        "output_format": output_format,
+        "chapter_count": len(
+            streaming_store.list_chapters(job_id, include_segments=False)
+        ),
+        "chapters": chapters,
+        "books": [],
+        "full_story": full_story,
+    }
+    _atomic_json_write(job_dir / JOB_METADATA_FILENAME, metadata)
+    invalidate_library_cache()
+    return metadata
+
+
+def _sync_streaming_job_summary(job_id: str, *, force: bool = False) -> Dict[str, Any]:
+    summary = streaming_store.summary(job_id)
+    chapters = streaming_store.list_chapters(job_id, include_segments=False)
+    total_segments = sum(int(chapter.get("total_segments") or 0) for chapter in chapters)
+    ready_segments = sum(int(chapter.get("ready_segments") or 0) for chapter in chapters)
+    progress = int((ready_segments / total_segments) * 100) if total_segments else 0
+    first_output = next(
+        (
+            _chunk_file_url(job_id, chapter.get("relative_path"))
+            for chapter in chapters
+            if chapter.get("state") == "ready" and chapter.get("relative_path")
+        ),
+        "",
+    )
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if entry is not None:
+            entry["chapter_count"] = len(chapters)
+            entry["total_chunks"] = total_segments
+            entry["processed_chunks"] = ready_segments
+            entry["progress"] = progress
+            entry["streaming_summary"] = summary
+            if first_output:
+                entry["output_file"] = first_output
+    _persist_job_state(job_id, force=force)
+    return summary
+
+
+def _register_streaming_chunk(
+    job_id: str,
+    job_dir: Path,
+    chapter_index: int,
+    segment: Dict[str, Any],
+) -> None:
+    record = {
+        "id": f"stream-{chapter_index}-{segment['segment_index']}",
+        "order_index": int(segment["segment_index"]),
+        "chapter_index": chapter_index,
+        "chunk_index": int(segment["segment_index"]),
+        "speaker": segment.get("speaker"),
+        "engine": "qwen3_custom",
+        "emotion": segment.get("emotion"),
+        "text": segment.get("text"),
+        "file_path": str(job_dir / str(segment.get("relative_path") or "")),
+        "relative_file": segment.get("relative_path"),
+        "duration_seconds": segment.get("duration_seconds"),
+        # Community RVC conversion is not a guarantee of a particular
+        # character's voice.  Keep the playback metadata truthful until a
+        # user-approved reference/model has passed listening review.
+        "voice_label": "社区 RVC 旁白" if segment.get("converted") else "神子风格旁白",
+    }
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if entry is None:
+            return
+        chunks = entry.setdefault("chunks", [])
+        existing_index = next(
+            (idx for idx, item in enumerate(chunks) if item.get("id") == record["id"]),
+            None,
+        )
+        if existing_index is None:
+            chunks.append(record)
+        else:
+            chunks[existing_index] = record
+
+
+def _streaming_merge_full_story(
+    job_id: str,
+    job_dir: Path,
+    chapters: List[Dict[str, Any]],
+    merger: AudioMerger,
+    output_format: str,
+) -> Optional[Dict[str, Any]]:
+    inputs = [
+        str(job_dir / chapter["relative_path"])
+        for chapter in chapters
+        if chapter.get("state") == "ready" and chapter.get("relative_path")
+    ]
+    if len(inputs) != len(chapters) or not inputs:
+        return None
+    final_path = job_dir / f"full_story.{output_format}"
+    partial_path = job_dir / f".full_story.partial.{output_format}"
+    merger.merge_wav_files(
+        input_files=inputs,
+        output_path=str(partial_path),
+        format=output_format,
+        cleanup_chunks=False,
+    )
+    os.replace(partial_path, final_path)
+    return {
+        "title": "完整有声书",
+        "file_url": f"/static/audio/{job_id}/{final_path.name}",
+        "relative_path": final_path.name,
+    }
+
+
+def _is_retryable_streaming_error(error: Exception | str) -> bool:
+    message = str(error or "").lower()
+    return any(
+        marker in message
+        for marker in (
+            "returned no audio",
+            "did not create an output",
+            "temporarily unavailable",
+            "timed out",
+        )
+    )
+
+
+def _fallback_voice_for_unnamed_streaming_speaker(
+    segment: Dict[str, Any],
+) -> Optional[str]:
+    """Choose a safe library fallback after an unnamed role exhausts retries.
+
+    A single bad clone lock must not stop a multi-day book. Named characters
+    (especially the protagonist) and the reviewed narrator are deliberately
+    excluded: their identity is more important than automatic continuation.
+    """
+    speaker = str(segment.get("speaker") or "").strip().lower()
+    if not speaker.startswith(("extra-", "unknown-", "cn-")):
+        return None
+    gender = str(segment.get("gender") or "neutral").lower()
+    expected_gender = "Female" if gender == "female" else "Male"
+    reserved = {
+        "fox_lady",
+        "warm_narrator",
+        "ink_narrator",
+        "rational_scribe",
+    }
+    candidates = sorted(
+        preset_id
+        for preset_id, preset in VOICE_PRESETS.items()
+        if preset_id not in reserved and preset.get("gender") == expected_gender
+    )
+    if not candidates:
+        return None
+    # Stable per scene role, so a retry cannot drift between voice identities.
+    # Scene-level uniqueness is established by the V3 director before synthesis;
+    # this path is only a last-resort replacement for a broken clone lock.
+    digest = hashlib.sha256(speaker.encode("utf-8")).digest()
+    return candidates[int.from_bytes(digest[:4], "big") % len(candidates)]
+
+
+def _process_streaming_audio_job_legacy(job_data: Dict[str, Any]) -> None:
+    """Generate finalized chunks immediately and keep one chapter ahead."""
+    job_id = job_data["job_id"]
+    text = job_data.get("text") or ""
+    config = dict(job_data.get("config") or {})
+    voice_assignments = build_streaming_voice_assignments(
+        text,
+        job_data.get("voice_assignments") or {},
+    )
+    word_replacements = job_data.get("word_replacements") or []
+    buffer_chapters = max(1, min(int(job_data.get("buffer_chapters") or 1), 5))
+    continue_full_book = bool(job_data.get("continue_full_book"))
+    narrator_conversion = job_data.get("narrator_conversion") or "none"
+    section_headings = job_data.get("section_headings")
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    output_format = str(config.get("output_format") or "mp3").lower()
+    processor = _create_text_processor_for_engine(
+        "qwen3_custom",
+        int(config.get("chunk_size") or 500),
+        config,
+    )
+    sections = _streaming_section_layout(text, section_headings)
+    chapter_plans: Dict[int, List[Dict[str, Any]]] = {}
+    started = time.monotonic()
+
+    streaming_store.ensure_chapters(job_id, sections)
+    for chapter in sections:
+        plan = _flatten_streaming_segments(
+            processor,
+            chapter.get("content") or "",
+            word_replacements,
+        )
+        chapter_plans[int(chapter["index"])] = plan
+        streaming_store.ensure_segments(job_id, int(chapter["index"]), plan)
+
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if entry is not None:
+            entry.update(
+                {
+                    "job_type": "streaming_audio",
+                    "streaming_mode": True,
+                    "buffer_chapters": buffer_chapters,
+                    "continue_full_book": continue_full_book,
+                    "narrator_conversion": narrator_conversion,
+                    "voice_assignments": voice_assignments,
+                    "chapter_mode": True,
+                    "chapter_count": len(sections),
+                    "review_mode": False,
+                    "engine": "qwen3_custom",
+                    "streaming_phase": "analyzing",
+                }
+            )
+            entry["job_payload"] = _build_job_payload(job_id, text, entry)
+    _sync_streaming_job_summary(job_id, force=True)
+
+    merger = AudioMerger(
+        crossfade_ms=int(max(0.0, float(config.get("crossfade_duration") or 0)) * 1000),
+        intro_silence_ms=int(max(0, config.get("intro_silence_ms", 0) or 0)),
+        inter_chunk_silence_ms=int(max(0, config.get("inter_chunk_silence_ms", 0) or 0)),
+        bitrate_kbps=int(config.get("output_bitrate_kbps") or 0),
+        acx_compliance=bool(config.get("acx_compliance", False)),
+    )
+    engine = None
+    strict_rvc = bool(config.get("rvc_strict", False))
+    rvc_auto_disabled = bool(job_data.get("rvc_auto_disabled"))
+    rvc_allowed = (
+        narrator_conversion == "yae_rvc"
+        and (strict_rvc or not rvc_auto_disabled)
+    )
+    first_chapter_limit = max(
+        1.0,
+        float(config.get("rvc_first_chapter_limit_minutes") or 60),
+    ) * 60
+    rvc_conversion_samples: List[float] = []
+    first_chapter_narrators = sum(
+        1
+        for segment in chapter_plans.get(0, [])
+        if speaker_gender(str(segment.get("speaker") or "")) == "narrator"
+    )
+    fallback_warning = (
+        "八重声线增强预计超过 "
+        f"{int(round(first_chapter_limit / 60))} 分钟，"
+        "后续旁白已切换为快速狐系声线"
+    )
+    # Transient worker errors are re-evaluated after a resume, while a measured
+    # first-chapter safety fallback persists across restarts.
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if entry is not None:
+            entry["streaming_warning"] = (
+                fallback_warning if rvc_auto_disabled and not strict_rvc else None
+            )
+
+    try:
+        while True:
+            if cancel_flags.get(job_id, False):
+                raise JobCancelled()
+            if pause_flags.get(job_id, False):
+                raise JobPaused()
+
+            playback = streaming_store.get_playback(job_id)
+            current_index = max(0, int(playback.get("chapter_index") or 0))
+            target_index = min(len(sections) - 1, current_index + buffer_chapters)
+            next_chapter = streaming_store.next_chapter(
+                job_id,
+                target_index=target_index,
+                continue_full_book=continue_full_book,
+            )
+            if not next_chapter:
+                chapters = streaming_store.list_chapters(job_id, include_segments=False)
+                all_ready = bool(chapters) and all(
+                    chapter.get("state") == "ready" for chapter in chapters
+                )
+                full_story = None
+                if all_ready and bool(job_data.get("generate_full_story")):
+                    full_story = _streaming_merge_full_story(
+                        job_id,
+                        job_dir,
+                        chapters,
+                        merger,
+                        output_format,
+                    )
+                _publish_streaming_metadata(
+                    job_id,
+                    job_dir,
+                    output_format=output_format,
+                    full_story=full_story,
+                )
+                with queue_lock:
+                    entry = jobs.get(job_id)
+                    if entry is not None:
+                        entry["status"] = "completed" if all_ready else "buffered"
+                        entry["streaming_phase"] = "ready" if all_ready else "buffered"
+                        entry["eta_seconds"] = 0 if all_ready else None
+                        if all_ready:
+                            entry["progress"] = 100
+                            entry["completed_at"] = datetime.now().isoformat()
+                        if full_story:
+                            entry["full_story"] = full_story
+                            entry["output_file"] = full_story["file_url"]
+                _sync_streaming_job_summary(job_id, force=True)
+                return
+
+            chapter_index = int(next_chapter["chapter_index"])
+            chapter = sections[chapter_index]
+            streaming_store.update_chapter(
+                job_id,
+                chapter_index,
+                state="synthesizing",
+                error=None,
+                attempts=int(next_chapter.get("attempts") or 0) + 1,
+            )
+            with queue_lock:
+                entry = jobs.get(job_id)
+                if entry is not None:
+                    entry["streaming_phase"] = "synthesizing"
+                    entry["active_chapter_index"] = chapter_index
+                    entry["active_chapter_title"] = chapter.get("title")
+
+            segment_rows = streaming_store.list_segments(job_id, chapter_index)
+            pending_rows = [
+                row for row in segment_rows if row.get("state") != "ready"
+            ]
+            chapter_dir = job_dir / f"chapter_{chapter_index + 1:04d}"
+            segment_dir = chapter_dir / "segments"
+            work_dir = chapter_dir / ".work"
+            segment_dir.mkdir(parents=True, exist_ok=True)
+            if work_dir.exists():
+                shutil.rmtree(work_dir, ignore_errors=True)
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            if pending_rows:
+                if engine is None:
+                    engine = get_tts_engine("qwen3_custom", config=config)
+                generation_segments = [
+                    {
+                        "speaker": row["speaker"],
+                        "text": row["text"],
+                        "chunks": [row["text"]],
+                        "emotion": row.get("emotion"),
+                    }
+                    for row in pending_rows
+                ]
+                callback_index = 0
+                last_completed_at = time.monotonic()
+
+                def on_chunk_ready(
+                    _chunk_index: int,
+                    metadata: Dict[str, Any],
+                    generated_path: str,
+                ) -> None:
+                    nonlocal callback_index, last_completed_at, rvc_allowed
+                    row = pending_rows[callback_index]
+                    callback_index += 1
+                    segment_index = int(row["segment_index"])
+                    speaker = str(row.get("speaker") or "default")
+                    source_path = Path(generated_path)
+                    final_path = segment_dir / f"segment_{segment_index:04d}.wav"
+                    converted_path = work_dir / f"converted_{segment_index:04d}.wav"
+                    converted = False
+                    warning = None
+
+                    streaming_store.update_segment(
+                        job_id,
+                        chapter_index,
+                        segment_index,
+                        state="synthesizing",
+                    )
+                    should_convert = rvc_allowed and speaker_gender(speaker) == "narrator"
+                    if should_convert:
+                        streaming_store.update_chapter(
+                            job_id,
+                            chapter_index,
+                            state="converting",
+                        )
+                        streaming_store.update_segment(
+                            job_id,
+                            chapter_index,
+                            segment_index,
+                            state="converting",
+                        )
+                        rvc_started_at = time.monotonic()
+                        converted, warning = rvc_service.convert(
+                            source_path,
+                            converted_path,
+                            config,
+                        )
+                        rvc_conversion_samples.append(
+                            max(0.001, time.monotonic() - rvc_started_at)
+                        )
+                        if not converted:
+                            rvc_allowed = False
+                    selected_path = converted_path if converted else source_path
+                    os.replace(selected_path, final_path)
+                    duration = _audio_file_duration(final_path)
+                    now_monotonic = time.monotonic()
+                    render_seconds = max(0.001, now_monotonic - last_completed_at)
+                    last_completed_at = now_monotonic
+                    relative_path = final_path.relative_to(job_dir).as_posix()
+                    streaming_store.update_segment(
+                        job_id,
+                        chapter_index,
+                        segment_index,
+                        state="ready",
+                        relative_path=relative_path,
+                        duration_seconds=duration,
+                        render_seconds=render_seconds,
+                        converted=int(converted),
+                        warning=warning,
+                        error=None,
+                    )
+                    if warning:
+                        with queue_lock:
+                            entry = jobs.get(job_id)
+                            if entry is not None:
+                                entry["streaming_warning"] = warning
+
+                    rows = streaming_store.list_segments(job_id, chapter_index)
+                    ready_rows = [item for item in rows if item.get("state") == "ready"]
+                    playable = sum(float(item.get("duration_seconds") or 0) for item in ready_rows)
+                    render_total = sum(float(item.get("render_seconds") or 0) for item in ready_rows)
+                    ratio = playable / render_total if render_total > 0 else 0.0
+                    playback_rate = max(
+                        0.25,
+                        float(
+                            streaming_store.get_playback(job_id).get("playback_rate")
+                            or 1
+                        ),
+                    )
+                    streamable = can_release_streaming_audio(
+                        ready_segments=len(ready_rows),
+                        playable_seconds=playable,
+                        render_seconds=render_total,
+                        playback_rate=playback_rate,
+                    )
+                    streaming_store.update_chapter(
+                        job_id,
+                        chapter_index,
+                        state="streamable" if streamable else "synthesizing",
+                        ready_segments=len(ready_rows),
+                        playable_seconds=playable,
+                        render_seconds=render_total,
+                        production_ratio=ratio,
+                    )
+                    _register_streaming_chunk(
+                        job_id,
+                        job_dir,
+                        chapter_index,
+                        {
+                            **row,
+                            **metadata,
+                            "relative_path": relative_path,
+                            "duration_seconds": duration,
+                            "converted": converted,
+                        },
+                    )
+                    _sync_streaming_job_summary(job_id)
+
+                    if (
+                        chapter_index == 0
+                        and not strict_rvc
+                        and project_conversion_seconds(
+                            rvc_conversion_samples,
+                            first_chapter_narrators,
+                        ) > first_chapter_limit
+                    ):
+                        rvc_allowed = False
+                        with queue_lock:
+                            entry = jobs.get(job_id)
+                            if entry is not None:
+                                entry["rvc_auto_disabled"] = True
+                                entry["streaming_warning"] = fallback_warning
+                    if cancel_flags.get(job_id, False):
+                        raise JobCancelled()
+                    if pause_flags.get(job_id, False):
+                        raise JobPaused()
+
+                with gpu_inference_lock:
+                    engine.generate_batch(
+                        segments=generation_segments,
+                        voice_config=voice_assignments,
+                        output_dir=str(work_dir),
+                        speed=float(config.get("speed") or 1),
+                        sample_rate=config.get("sample_rate"),
+                        chunk_cb=on_chunk_ready,
+                    )
+
+            ready_rows = [
+                row
+                for row in streaming_store.list_segments(job_id, chapter_index)
+                if row.get("state") == "ready" and row.get("relative_path")
+            ]
+            if len(ready_rows) != len(chapter_plans.get(chapter_index) or []):
+                raise RuntimeError(
+                    f"第 {chapter_index + 1} 章仍有未完成片段，无法发布"
+                )
+            input_files = [
+                str(job_dir / row["relative_path"])
+                for row in sorted(ready_rows, key=lambda item: item["segment_index"])
+            ]
+            slug = slugify_filename(
+                chapter.get("title"),
+                f"chapter-{chapter_index + 1:04d}",
+            )
+            final_path = chapter_dir / f"{slug}.{output_format}"
+            partial_path = chapter_dir / f".{slug}.partial.{output_format}"
+            merger.merge_wav_files(
+                input_files=input_files,
+                output_path=str(partial_path),
+                format=output_format,
+                cleanup_chunks=False,
+            )
+            os.replace(partial_path, final_path)
+            duration = _audio_file_duration(final_path) or sum(
+                float(row.get("duration_seconds") or 0) for row in ready_rows
+            )
+            streaming_store.update_chapter(
+                job_id,
+                chapter_index,
+                state="ready",
+                ready_segments=len(ready_rows),
+                playable_seconds=duration,
+                duration_seconds=duration,
+                relative_path=final_path.relative_to(job_dir).as_posix(),
+                priority=0,
+                error=None,
+            )
+            _persist_chunks_metadata(job_id, job_dir)
+            _publish_streaming_metadata(
+                job_id,
+                job_dir,
+                output_format=output_format,
+            )
+            # Community contribution is deliberately detached from the render
+            # worker.  A network failure must never pause the user's local
+            # book; the durable local ledger retries on the next completed
+            # chapter/run without regenerating audio.
+            if CommunityLibraryClient.enabled(config):
+                try:
+                    with queue_lock:
+                        contribution_entry = copy.deepcopy(jobs.get(job_id) or {})
+                    contribution_chapters = streaming_store.list_chapters(
+                        job_id,
+                        include_segments=True,
+                    )
+                    contribution_chapter = next(
+                        item for item in contribution_chapters
+                        if int(item["chapter_index"]) == chapter_index
+                    )
+                    community_library.contribute_async(
+                        config=copy.deepcopy(config),
+                        job_id=job_id,
+                        job_entry=contribution_entry,
+                        job_dir=job_dir,
+                        chapter=contribution_chapter,
+                        all_chapters=contribution_chapters,
+                    )
+                except Exception as contribution_error:
+                    logger.warning(
+                        "Unable to queue community contribution for %s/%s: %s",
+                        job_id,
+                        chapter_index,
+                        contribution_error,
+                    )
+            _sync_streaming_job_summary(job_id, force=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
+    except JobPaused:
+        with queue_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["status"] = "paused"
+                jobs[job_id]["paused_at"] = datetime.now().isoformat()
+                jobs[job_id]["streaming_phase"] = "paused"
+        _sync_streaming_job_summary(job_id, force=True)
+    except JobCancelled:
+        with queue_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["status"] = "cancelled"
+                jobs[job_id]["streaming_phase"] = "cancelled"
+        _sync_streaming_job_summary(job_id, force=True)
+    except Exception as exc:
+        active_index = int((jobs.get(job_id) or {}).get("active_chapter_index") or 0)
+        active_chapter = next(
+            (
+                chapter
+                for chapter in streaming_store.list_chapters(
+                    job_id,
+                    include_segments=False,
+                )
+                if int(chapter["chapter_index"]) == active_index
+            ),
+            {},
+        )
+        attempts = int(active_chapter.get("attempts") or 0)
+        failed_segment = next(
+            (
+                segment
+                for segment in streaming_store.list_segments(job_id, active_index)
+                if segment.get("state") != "ready"
+            ),
+            None,
+        )
+        will_retry = _is_retryable_streaming_error(exc) and attempts < 3
+        if failed_segment is not None:
+            streaming_store.update_segment(
+                job_id,
+                active_index,
+                int(failed_segment["segment_index"]),
+                state="pending" if will_retry else "failed",
+                attempts=int(failed_segment.get("attempts") or 0) + 1,
+                error=(
+                    f"正在重试：{exc}"
+                    if will_retry
+                    else str(exc)
+                ),
+            )
+        if will_retry:
+            streaming_store.update_chapter(
+                job_id,
+                active_index,
+                state="pending",
+                error=f"片段生成失败，正在自动重试（{attempts}/3）：{exc}",
+            )
+            with queue_lock:
+                entry = jobs.get(job_id)
+                if entry is not None:
+                    entry["status"] = "queued"
+                    entry["error"] = None
+                    entry["streaming_phase"] = "retrying"
+                    retry_payload = _build_job_data_from_entry(job_id, entry)
+                else:
+                    retry_payload = None
+            if retry_payload is not None:
+                job_queue.put(retry_payload)
+                _persist_job_state(job_id, force=True)
+                _sync_streaming_job_summary(job_id, force=True)
+                return
+        streaming_store.update_chapter(
+            job_id,
+            active_index,
+            state="failed",
+            error=str(exc),
+        )
+        with queue_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["error"] = str(exc)
+                jobs[job_id]["streaming_phase"] = "failed"
+        _sync_streaming_job_summary(job_id, force=True)
+        raise
+    finally:
+        elapsed = max(0.0, time.monotonic() - started)
+        with queue_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["timing_metrics"] = {
+                    **(jobs[job_id].get("timing_metrics") or {}),
+                    "total_seconds": round(elapsed, 1),
+                }
+        cancel_flags.pop(job_id, None)
+        cancel_events.pop(job_id, None)
+        if (jobs.get(job_id) or {}).get("status") != "paused":
+            pause_flags.pop(job_id, None)
+
+
+def _streaming_batch_key(
+    segment: Dict[str, Any],
+    voice_assignments: Dict[str, Dict[str, Any]],
+) -> Tuple[str, str, str, str]:
+    speaker = str(segment.get("speaker") or "default")
+    assignment = (
+        voice_assignments.get(speaker)
+        or voice_assignments.get("default")
+        or {}
+    )
+    extra = assignment.get("extra") or {}
+    return (
+        str(assignment.get("voice") or ""),
+        str(segment.get("emotion") or "auto"),
+        str(extra.get("language") or "Chinese").lower(),
+        str(segment.get("gender") or speaker_gender(speaker)),
+    )
+
+
+def _select_adaptive_streaming_batch(
+    pending_rows: List[Dict[str, Any]],
+    voice_assignments: Dict[str, Dict[str, Any]],
+    *,
+    window_segments: int = 12,
+    batch_size: int = 2,
+) -> List[Dict[str, Any]]:
+    """Select the earliest row plus compatible neighbours in a small window."""
+    ordered = sorted(pending_rows, key=lambda row: int(row["segment_index"]))
+    if not ordered:
+        return []
+    anchor = ordered[0]
+    key = _streaming_batch_key(anchor, voice_assignments)
+    selected = [anchor]
+    for row in ordered[1:max(1, int(window_segments))]:
+        if len(selected) >= max(1, int(batch_size)):
+            break
+        if _streaming_batch_key(row, voice_assignments) == key:
+            selected.append(row)
+    return selected
+
+
+def _contiguous_ready_segments(
+    rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    ready: List[Dict[str, Any]] = []
+    for row in sorted(rows, key=lambda item: int(item["segment_index"])):
+        if row.get("state") != "ready" or not row.get("relative_path"):
+            break
+        ready.append(row)
+    return ready
+
+
+def _streaming_memory_limit_mb() -> float:
+    try:
+        total_bytes = int(os.sysconf("SC_PAGE_SIZE")) * int(
+            os.sysconf("SC_PHYS_PAGES")
+        )
+        return (total_bytes / (1024 * 1024)) * 0.78
+    except (AttributeError, OSError, TypeError, ValueError):
+        return 12_800.0
+
+
+def _is_batch_pressure_error(error: Exception | str) -> bool:
+    message = str(error or "").lower()
+    return any(
+        marker in message
+        for marker in (
+            "out of memory",
+            "memoryerror",
+            "bad_alloc",
+            "metal command buffer",
+            "returned no audio",
+            "omitted sequence",
+        )
+    )
+
+
+def _analyze_streaming_cast_v3(
+    source_text: str,
+    section_headings: Optional[Any],
+    config: Dict[str, Any],
+    cached_characters: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Full-book deterministic cast pass followed by Ollama fact review."""
+    sections = _streaming_section_layout(source_text, section_headings)
+    characters = analyze_book_characters(
+        sections,
+        synopsis=extract_synopsis(source_text),
+        allow_multiple_protagonists=True,
+        max_protagonists=None,
+        scan_all_chapters=True,
+    )
+    cached_by_name = {
+        str(character.get("name") or ""): character
+        for character in (cached_characters or [])
+    }
+    cached_review_complete = bool(characters)
+    for character in characters:
+        cached = cached_by_name.get(str(character.get("name") or ""))
+        cached_evidence = (cached or {}).get("evidence") or {}
+        if not cached or not cached_evidence.get("llm_reason"):
+            if (
+                character.get("role_tier") in {"lead", "recurring"}
+                and character.get("gender") == "neutral"
+            ):
+                cached_review_complete = False
+            continue
+        if cached.get("gender") in {"male", "female"}:
+            character["gender"] = cached["gender"]
+            character["gender_confidence"] = cached.get("gender_confidence") or cached_evidence.get("gender_confidence") or character.get("gender_confidence")
+        character["role_tier"] = cached.get("role_tier") or character.get("role_tier")
+        character["voice_locked"] = character["role_tier"] in {"lead", "recurring"}
+        character["aliases"] = list(dict.fromkeys([
+            *(character.get("aliases") or []),
+            *(cached.get("aliases") or []),
+        ]))
+        character.setdefault("evidence", {}).update({
+            "llm_reason": cached_evidence.get("llm_reason"),
+            "gender_confidence": cached_evidence.get("gender_confidence"),
+        })
+    if cached_review_complete:
+        return sections, assign_character_voices(characters)
+    try:
+        review_config = dict(config)
+        review_config["llm_local_max_tokens"] = min(
+            400,
+            max(192, int(config.get("llm_local_max_tokens") or 400)),
+        )
+        characters = refine_characters_with_llm(
+            characters,
+            sections,
+            lambda prompt: _run_llm_prompt(prompt, review_config),
+            batch_size=1,
+        )
+    except Exception as exc:
+        logger.warning("V3 cast review fell back to deterministic evidence: %s", exc)
+    return sections, characters
+
+
+def _process_streaming_audio_job_v2(job_data: Dict[str, Any]) -> None:
+    """Adaptive Qwen batching with an independent narrator RVC consumer."""
+    job_id = job_data["job_id"]
+    pipeline_version = max(2, int(job_data.get("streaming_pipeline_version") or 2))
+    config = dict(job_data.get("config") or {})
+    source_text = (
+        job_data.get("source_text")
+        or _load_job_text(job_data.get("source_text_path"))
+        or strip_speaker_tags(job_data.get("text") or "")
+    )
+    section_headings = job_data.get("section_headings")
+    if pipeline_version >= 3 and not job_data.get("cast_analysis_complete"):
+        raw_sections, characters = _analyze_streaming_cast_v3(
+            source_text,
+            section_headings,
+            config,
+        )
+        streaming_store.replace_characters(job_id, characters)
+        job_data["cast_analysis_complete"] = True
+    else:
+        characters = streaming_store.list_characters(job_id)
+        raw_sections = _streaming_section_layout(source_text, section_headings)
+    sections: List[Dict[str, Any]] = []
+    chapter_plans: Dict[int, List[Dict[str, Any]]] = {}
+    processor = _create_text_processor_for_engine(
+        "qwen3_custom",
+        int(config.get("chunk_size") or 500),
+        config,
+    )
+    word_replacements = job_data.get("word_replacements") or []
+    for raw_section in raw_sections:
+        detail = tag_chinese_dialogue_detailed(
+            raw_section.get("content") or "",
+            characters,
+            scene_key=f"chapter-{int(raw_section.get('index') or 0)}",
+        )
+        tagged_content = (
+            detail.tagged_text
+            if detail
+            else f"[narrator]{raw_section.get('content') or ''}[/narrator]"
+        )
+        section = {**raw_section, "content": tagged_content}
+        sections.append(section)
+        chapter_plans[int(section["index"])] = _flatten_streaming_segments(
+            processor,
+            tagged_content,
+            word_replacements,
+            source_text=raw_section.get("content") or "",
+            source_base=int(raw_section.get("source_start") or 0),
+            attributions=detail.attributions if detail else [],
+            chapter_index=int(section["index"]),
+            generation_version=pipeline_version,
+        )
+
+    supplied_assignments = copy.deepcopy(job_data.get("voice_assignments") or {})
+    for character in characters:
+        voice = str(character.get("voice") or "")
+        character_id = str(character.get("character_id") or "")
+        if voice and character_id:
+            assignment = supplied_assignments.setdefault(character_id, {})
+            assignment["voice"] = voice
+            assignment.setdefault("extra", {}).setdefault("language", "Chinese")
+    tagged_book = "\n".join(section["content"] for section in sections)
+    voice_assignments = build_streaming_voice_assignments(
+        tagged_book,
+        supplied_assignments,
+        speaker_genders={
+            str(segment.get("speaker") or ""): str(segment.get("gender") or "neutral")
+            for plan in chapter_plans.values()
+            for segment in plan
+        },
+    )
+    cast_audit = None
+    if pipeline_version >= 3:
+        cast_audit = audit_streaming_cast(
+            characters,
+            [segment for plan in chapter_plans.values() for segment in plan],
+            voice_assignments,
+        )
+        streaming_store.save_cast_audit(job_id, cast_audit)
+        if not cast_audit.get("ready"):
+            streaming_store.ensure_chapters(job_id, sections)
+            for chapter in sections:
+                streaming_store.ensure_segments(
+                    job_id,
+                    int(chapter["index"]),
+                    chapter_plans[int(chapter["index"])],
+                )
+            with queue_lock:
+                entry = jobs.get(job_id)
+                if entry is not None:
+                    entry.update({
+                        "status": "paused",
+                        "streaming_phase": "cast_review",
+                        "streaming_pipeline_version": pipeline_version,
+                        "voice_assignments": voice_assignments,
+                        "cast_analysis_complete": True,
+                        "cast_audit": cast_audit,
+                    })
+                    entry["job_payload"] = _build_job_payload(
+                        job_id,
+                        tagged_book,
+                        entry,
+                    )
+            _persist_job_state(job_id, force=True)
+            return
+
+    buffer_chapters = max(1, min(int(job_data.get("buffer_chapters") or 1), 5))
+    continue_full_book = bool(job_data.get("continue_full_book"))
+    narrator_conversion = job_data.get("narrator_conversion") or "none"
+    batch_strategy = str(job_data.get("batch_strategy") or "adaptive_window")
+    window_segments = max(
+        1,
+        min(int(job_data.get("batch_window_segments") or 12), 64),
+    )
+    configured_max_batch = max(
+        1,
+        min(int(job_data.get("max_batch_size") or 4), 4),
+    )
+    if batch_strategy == "serial":
+        configured_max_batch = 1
+    current_batch_size = min(2, configured_max_batch)
+    stable_batches = 0
+    memory_limit_mb = _streaming_memory_limit_mb()
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    generation_dir = job_dir / "v3" if pipeline_version >= 3 else job_dir
+    generation_dir.mkdir(parents=True, exist_ok=True)
+    output_format = str(config.get("output_format") or "mp3").lower()
+    started = time.monotonic()
+
+    streaming_store.ensure_chapters(job_id, sections)
+    for chapter in sections:
+        streaming_store.ensure_segments(
+            job_id,
+            int(chapter["index"]),
+            chapter_plans[int(chapter["index"])],
+        )
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if entry is not None:
+            entry.update(
+                {
+                    "job_type": "streaming_audio",
+                    "streaming_mode": True,
+                    "streaming_pipeline_version": pipeline_version,
+                    "voice_assignments": voice_assignments,
+                    "chapter_mode": True,
+                    "chapter_count": len(sections),
+                    "review_mode": False,
+                    "engine": "qwen3_custom",
+                    "streaming_phase": "analyzing",
+                    "batch_strategy": batch_strategy,
+                    "batch_window_segments": window_segments,
+                    "max_batch_size": configured_max_batch,
+                    "cast_analysis_complete": pipeline_version >= 3,
+                    "cast_audit": cast_audit,
+                    "streaming_warning": None,
+                }
+            )
+            entry["job_payload"] = _build_job_payload(job_id, tagged_book, entry)
+    _sync_streaming_job_summary(job_id, force=True)
+
+    merger = AudioMerger(
+        crossfade_ms=int(
+            max(0.0, float(config.get("crossfade_duration") or 0)) * 1000
+        ),
+        intro_silence_ms=int(max(0, config.get("intro_silence_ms", 0) or 0)),
+        inter_chunk_silence_ms=int(
+            max(0, config.get("inter_chunk_silence_ms", 0) or 0)
+        ),
+        bitrate_kbps=int(config.get("output_bitrate_kbps") or 0),
+        acx_compliance=bool(config.get("acx_compliance", False)),
+    )
+    engine = None
+    strict_rvc = bool(config.get("rvc_strict", False))
+    rvc_allowed = {
+        "value": (
+            narrator_conversion == "yae_rvc"
+            and (
+                strict_rvc
+                or not bool(job_data.get("rvc_auto_disabled"))
+            )
+        )
+    }
+    first_chapter_limit = max(
+        1.0,
+        float(config.get("rvc_first_chapter_limit_minutes") or 60),
+    ) * 60
+    first_chapter_narrators = sum(
+        1
+        for segment in chapter_plans.get(0, [])
+        if segment.get("gender") == "narrator"
+    )
+    rvc_conversion_samples: List[float] = []
+    fallback_warning = (
+        "八重声线增强预计超过 "
+        f"{int(round(first_chapter_limit / 60))} 分钟，"
+        "后续旁白已切换为快速狐系声线"
+    )
+
+    try:
+        while True:
+            if cancel_flags.get(job_id, False):
+                raise JobCancelled()
+            if pause_flags.get(job_id, False):
+                raise JobPaused()
+            playback = streaming_store.get_playback(job_id)
+            current_index = max(0, int(playback.get("chapter_index") or 0))
+            target_index = min(len(sections) - 1, current_index + buffer_chapters)
+            next_chapter = streaming_store.next_chapter(
+                job_id,
+                target_index=target_index,
+                continue_full_book=continue_full_book,
+            )
+            if not next_chapter:
+                chapters = streaming_store.list_chapters(
+                    job_id,
+                    include_segments=False,
+                )
+                all_ready = bool(chapters) and all(
+                    chapter.get("state") == "ready" for chapter in chapters
+                )
+                full_story = None
+                if all_ready and bool(job_data.get("generate_full_story")):
+                    full_story = _streaming_merge_full_story(
+                        job_id,
+                        job_dir,
+                        chapters,
+                        merger,
+                        output_format,
+                    )
+                _publish_streaming_metadata(
+                    job_id,
+                    job_dir,
+                    output_format=output_format,
+                    full_story=full_story,
+                )
+                with queue_lock:
+                    entry = jobs.get(job_id)
+                    if entry is not None:
+                        entry["status"] = "completed" if all_ready else "buffered"
+                        entry["streaming_phase"] = (
+                            "ready" if all_ready else "buffered"
+                        )
+                        entry["eta_seconds"] = 0 if all_ready else None
+                        if all_ready:
+                            entry["progress"] = 100
+                            entry["completed_at"] = datetime.now().isoformat()
+                        if full_story:
+                            entry["full_story"] = full_story
+                            entry["output_file"] = full_story["file_url"]
+                _sync_streaming_job_summary(job_id, force=True)
+                return
+
+            chapter_index = int(next_chapter["chapter_index"])
+            chapter = sections[chapter_index]
+            chapter_started = time.monotonic()
+            base_qwen = float(next_chapter.get("qwen_seconds") or 0)
+            base_rvc = float(next_chapter.get("rvc_seconds") or 0)
+            base_render = float(next_chapter.get("render_seconds") or 0)
+            metrics = {
+                "qwen": base_qwen,
+                "rvc": base_rvc,
+                "peak": float(next_chapter.get("peak_memory_mb") or 0),
+            }
+            metrics_lock = threading.Lock()
+            streaming_store.update_chapter(
+                job_id,
+                chapter_index,
+                state="synthesizing",
+                error=None,
+                attempts=int(next_chapter.get("attempts") or 0) + 1,
+                current_batch_size=current_batch_size,
+            )
+            with queue_lock:
+                entry = jobs.get(job_id)
+                if entry is not None:
+                    entry["streaming_phase"] = "synthesizing"
+                    entry["active_chapter_index"] = chapter_index
+                    entry["active_chapter_title"] = chapter.get("title")
+
+            chapter_dir = generation_dir / f"chapter_{chapter_index + 1:04d}"
+            segment_dir = chapter_dir / "segments"
+            work_dir = chapter_dir / ".work"
+            segment_dir.mkdir(parents=True, exist_ok=True)
+            if work_dir.exists():
+                shutil.rmtree(work_dir, ignore_errors=True)
+            work_dir.mkdir(parents=True, exist_ok=True)
+            rvc_tasks: queue.Queue = queue.Queue(
+                maxsize=max(4, configured_max_batch * 2)
+            )
+            rvc_stop = object()
+            qwen_finished = {"value": False}
+
+            def refresh_chapter_progress() -> None:
+                rows = streaming_store.list_segments(job_id, chapter_index)
+                ready_rows = [
+                    row for row in rows if row.get("state") == "ready"
+                ]
+                contiguous = _contiguous_ready_segments(rows)
+                playable = sum(
+                    float(row.get("duration_seconds") or 0)
+                    for row in contiguous
+                )
+                render_total = base_render + max(
+                    0.001,
+                    time.monotonic() - chapter_started,
+                )
+                ratio = playable / render_total if render_total > 0 else 0.0
+                playback_rate = max(
+                    0.25,
+                    float(
+                        streaming_store.get_playback(job_id).get(
+                            "playback_rate"
+                        )
+                        or 1
+                    ),
+                )
+                streamable = can_release_streaming_audio(
+                    ready_segments=len(contiguous),
+                    playable_seconds=playable,
+                    render_seconds=render_total,
+                    playback_rate=playback_rate,
+                )
+                with metrics_lock:
+                    qwen_seconds = float(metrics["qwen"])
+                    rvc_seconds = float(metrics["rvc"])
+                    peak_memory = float(metrics["peak"])
+                overlap = max(
+                    0.0,
+                    min(qwen_seconds, rvc_seconds, qwen_seconds + rvc_seconds - render_total),
+                )
+                active_state = (
+                    "streamable"
+                    if streamable
+                    else (
+                        "converting"
+                        if qwen_finished["value"] and rvc_tasks.unfinished_tasks
+                        else "synthesizing"
+                    )
+                )
+                streaming_store.update_chapter(
+                    job_id,
+                    chapter_index,
+                    state=active_state,
+                    ready_segments=len(ready_rows),
+                    playable_seconds=playable,
+                    render_seconds=render_total,
+                    production_ratio=ratio,
+                    qwen_seconds=qwen_seconds,
+                    rvc_seconds=rvc_seconds,
+                    overlap_seconds=overlap,
+                    peak_memory_mb=peak_memory,
+                    current_batch_size=current_batch_size,
+                )
+                _sync_streaming_job_summary(job_id)
+
+            def finalize_segment(
+                row: Dict[str, Any],
+                metadata: Dict[str, Any],
+                source_path: Path,
+                selected_path: Path,
+                *,
+                converted: bool,
+                warning: Optional[str],
+                rvc_seconds: float = 0,
+            ) -> None:
+                segment_index = int(row["segment_index"])
+                final_path = segment_dir / f"segment_{segment_index:04d}.wav"
+                os.replace(selected_path, final_path)
+                duration = _audio_file_duration(final_path)
+                relative_path = final_path.relative_to(job_dir).as_posix()
+                qwen_seconds = float(metadata.get("qwen_seconds") or 0)
+                batch_size_value = int(metadata.get("batch_size") or 1)
+                peak_memory = float(
+                    metadata.get("batch_peak_memory_mb") or 0
+                )
+                streaming_store.update_segment(
+                    job_id,
+                    chapter_index,
+                    segment_index,
+                    state="ready",
+                    relative_path=relative_path,
+                    duration_seconds=duration,
+                    render_seconds=qwen_seconds + float(rvc_seconds),
+                    qwen_seconds=qwen_seconds,
+                    rvc_seconds=float(rvc_seconds),
+                    batch_size=batch_size_value,
+                    peak_memory_mb=peak_memory,
+                    converted=int(converted),
+                    warning=warning,
+                    error=None,
+                )
+                _register_streaming_chunk(
+                    job_id,
+                    job_dir,
+                    chapter_index,
+                    {
+                        **row,
+                        **metadata,
+                        "relative_path": relative_path,
+                        "duration_seconds": duration,
+                        "converted": converted,
+                    },
+                )
+                if warning:
+                    with queue_lock:
+                        entry = jobs.get(job_id)
+                        if entry is not None:
+                            entry["streaming_warning"] = warning
+                refresh_chapter_progress()
+
+            def rvc_consumer() -> None:
+                while True:
+                    task = rvc_tasks.get()
+                    try:
+                        if task is rvc_stop:
+                            return
+                        row, metadata, source_path = task
+                        segment_index = int(row["segment_index"])
+                        converted_path = (
+                            work_dir / f"converted_{segment_index:04d}.wav"
+                        )
+                        converted = False
+                        warning = None
+                        conversion_seconds = 0.0
+                        if rvc_allowed["value"]:
+                            started_rvc = time.monotonic()
+                            try:
+                                converted, warning = rvc_service.convert(
+                                    source_path,
+                                    converted_path,
+                                    config,
+                                )
+                            except Exception as exc:
+                                warning = f"八重声线转换失败，已使用快速旁白：{exc}"
+                                converted = False
+                            conversion_seconds = max(
+                                0.001,
+                                time.monotonic() - started_rvc,
+                            )
+                            with metrics_lock:
+                                metrics["rvc"] += conversion_seconds
+                            rvc_conversion_samples.append(conversion_seconds)
+                            if not converted:
+                                rvc_allowed["value"] = False
+                        selected_path = (
+                            converted_path if converted else source_path
+                        )
+                        finalize_segment(
+                            row,
+                            metadata,
+                            source_path,
+                            selected_path,
+                            converted=converted,
+                            warning=warning,
+                            rvc_seconds=conversion_seconds,
+                        )
+                        if (
+                            chapter_index == 0
+                            and not strict_rvc
+                            and project_conversion_seconds(
+                                rvc_conversion_samples,
+                                first_chapter_narrators,
+                            )
+                            > first_chapter_limit
+                        ):
+                            rvc_allowed["value"] = False
+                            with queue_lock:
+                                entry = jobs.get(job_id)
+                                if entry is not None:
+                                    entry["rvc_auto_disabled"] = True
+                                    entry["streaming_warning"] = fallback_warning
+                    finally:
+                        rvc_tasks.task_done()
+
+            rvc_thread = threading.Thread(
+                target=rvc_consumer,
+                name=f"rvc-{job_id[:8]}-{chapter_index}",
+                daemon=True,
+            )
+            rvc_thread.start()
+            switch_chapter = False
+            pending_exception: Optional[BaseException] = None
+            try:
+                while True:
+                    rows = streaming_store.list_segments(job_id, chapter_index)
+                    pending_rows = [
+                        row for row in rows if row.get("state") == "pending"
+                    ]
+                    if not pending_rows:
+                        break
+                    with queue_lock:
+                        current_entry = jobs.get(job_id) or {}
+                        current_assignments = copy.deepcopy(
+                            current_entry.get("voice_assignments")
+                            or voice_assignments
+                        )
+                    batch_rows = _select_adaptive_streaming_batch(
+                        pending_rows,
+                        current_assignments,
+                        window_segments=window_segments,
+                        batch_size=current_batch_size,
+                    )
+                    for row in batch_rows:
+                        streaming_store.update_segment(
+                            job_id,
+                            chapter_index,
+                            int(row["segment_index"]),
+                            state="synthesizing",
+                            error=None,
+                        )
+                    if engine is None:
+                        engine = get_tts_engine("qwen3_custom", config=config)
+                    batch_dir = work_dir / (
+                        f"qwen_{int(batch_rows[0]['segment_index']):04d}_"
+                        f"{uuid.uuid4().hex[:8]}"
+                    )
+                    batch_dir.mkdir(parents=True, exist_ok=True)
+                    generation_segments = [
+                        {
+                            "speaker": row["speaker"],
+                            "text": row["text"],
+                            "chunks": [row["text"]],
+                            "emotion": row.get("emotion"),
+                        }
+                        for row in batch_rows
+                    ]
+                    batch_peak = {"value": 0.0}
+
+                    def on_chunk_ready_v2(
+                        _chunk_index: int,
+                        metadata: Dict[str, Any],
+                        generated_path: str,
+                    ) -> None:
+                        local_index = int(metadata.get("segment_index") or 0)
+                        row = batch_rows[local_index]
+                        segment_index = int(row["segment_index"])
+                        source_path = Path(generated_path)
+                        peak_memory = float(
+                            metadata.get("batch_peak_memory_mb") or 0
+                        )
+                        batch_peak["value"] = max(
+                            batch_peak["value"],
+                            peak_memory,
+                        )
+                        with metrics_lock:
+                            metrics["peak"] = max(
+                                float(metrics["peak"]),
+                                peak_memory,
+                            )
+                        should_convert = (
+                            rvc_allowed["value"]
+                            and row.get("gender") == "narrator"
+                        )
+                        if should_convert:
+                            streaming_store.update_segment(
+                                job_id,
+                                chapter_index,
+                                segment_index,
+                                state="converting",
+                            )
+                            rvc_tasks.put((row, dict(metadata), source_path))
+                        else:
+                            finalize_segment(
+                                row,
+                                metadata,
+                                source_path,
+                                source_path,
+                                converted=False,
+                                warning=None,
+                            )
+
+                    batch_started = time.monotonic()
+                    try:
+                        with gpu_inference_lock:
+                            engine.generate_batch(
+                                segments=generation_segments,
+                                voice_config=current_assignments,
+                                output_dir=str(batch_dir),
+                                speed=float(config.get("speed") or 1),
+                                sample_rate=config.get("sample_rate"),
+                                chunk_cb=on_chunk_ready_v2,
+                            )
+                    except Exception as exc:
+                        latest = {
+                            int(row["segment_index"]): row
+                            for row in streaming_store.list_segments(
+                                job_id,
+                                chapter_index,
+                            )
+                        }
+                        for row in batch_rows:
+                            current = latest.get(int(row["segment_index"])) or {}
+                            if current.get("state") != "ready":
+                                streaming_store.update_segment(
+                                    job_id,
+                                    chapter_index,
+                                    int(row["segment_index"]),
+                                    state="pending",
+                                    error=f"批处理降级重试：{exc}",
+                                )
+                        if current_batch_size > 1:
+                            current_batch_size = max(
+                                1,
+                                current_batch_size // 2,
+                            )
+                            stable_batches = 0
+                            streaming_store.update_chapter(
+                                job_id,
+                                chapter_index,
+                                current_batch_size=current_batch_size,
+                            )
+                            continue
+                        # A named protagonist/narrator must never silently
+                        # change voice. For an unnamed minor role, however,
+                        # an exhausted clone lock should not kill a days-long
+                        # audiobook: switch that role only to a gender-safe
+                        # library fallback and retry its pending segment.
+                        fallback_row = batch_rows[0] if batch_rows else {}
+                        fallback_voice = _fallback_voice_for_unnamed_streaming_speaker(
+                            fallback_row
+                        )
+                        speaker_key = str(fallback_row.get("speaker") or "")
+                        current_voice = str(
+                            (current_assignments.get(speaker_key) or {}).get("voice")
+                            or ""
+                        )
+                        if fallback_voice and fallback_voice != current_voice:
+                            with queue_lock:
+                                entry = jobs.get(job_id)
+                                if entry is not None:
+                                    assignments = entry.setdefault(
+                                        "voice_assignments", {}
+                                    )
+                                    replacement = dict(
+                                        assignments.get(speaker_key) or {}
+                                    )
+                                    replacement["voice"] = fallback_voice
+                                    replacement.setdefault("extra", {}).setdefault(
+                                        "language", "Chinese"
+                                    )
+                                    assignments[speaker_key] = replacement
+                                    entry["streaming_warning"] = (
+                                        f"未命名角色 {speaker_key} 的原声线无音频输出，"
+                                        f"已自动改用 {fallback_voice} 并继续制作"
+                                    )
+                            _persist_job_state(job_id, force=True)
+                            logger.warning(
+                                "Falling back unnamed speaker %s from %s to %s after empty audio",
+                                speaker_key,
+                                current_voice or "(unset)",
+                                fallback_voice,
+                            )
+                            continue
+                        raise
+                    batch_seconds = max(
+                        0.001,
+                        time.monotonic() - batch_started,
+                    )
+                    with metrics_lock:
+                        metrics["qwen"] += batch_seconds
+                    peak_safe = (
+                        batch_peak["value"] <= 0
+                        or batch_peak["value"] < memory_limit_mb
+                    )
+                    stable_batches = stable_batches + 1 if peak_safe else 0
+                    if (
+                        current_batch_size < configured_max_batch
+                        and stable_batches >= 2
+                    ):
+                        current_batch_size = configured_max_batch
+                        stable_batches = 0
+                    refresh_chapter_progress()
+                    if cancel_flags.get(job_id, False):
+                        raise JobCancelled()
+                    if pause_flags.get(job_id, False):
+                        raise JobPaused()
+                    priority_target = next(
+                        (
+                            item
+                            for item in streaming_store.list_chapters(
+                                job_id,
+                                include_segments=False,
+                            )
+                            if int(item.get("priority") or 0) > 0
+                            and int(item["chapter_index"]) != chapter_index
+                            and item.get("state") != "ready"
+                        ),
+                        None,
+                    )
+                    if priority_target:
+                        switch_chapter = True
+                        break
+                qwen_finished["value"] = True
+                refresh_chapter_progress()
+                rvc_tasks.join()
+            except BaseException as exc:
+                pending_exception = exc
+                qwen_finished["value"] = True
+                rvc_tasks.join()
+            finally:
+                rvc_tasks.put(rvc_stop)
+                rvc_thread.join(timeout=10)
+            if pending_exception is not None:
+                raise pending_exception
+            if switch_chapter:
+                refresh_chapter_progress()
+                shutil.rmtree(work_dir, ignore_errors=True)
+                continue
+
+            ready_rows = [
+                row
+                for row in streaming_store.list_segments(job_id, chapter_index)
+                if row.get("state") == "ready" and row.get("relative_path")
+            ]
+            if len(ready_rows) != len(chapter_plans.get(chapter_index) or []):
+                raise RuntimeError(
+                    f"第 {chapter_index + 1} 章仍有未完成片段，无法发布"
+                )
+            input_files = [
+                str(job_dir / row["relative_path"])
+                for row in sorted(
+                    ready_rows,
+                    key=lambda item: item["segment_index"],
+                )
+            ]
+            slug = slugify_filename(
+                chapter.get("title"),
+                f"chapter-{chapter_index + 1:04d}",
+            )
+            final_path = chapter_dir / f"{slug}.{output_format}"
+            partial_path = chapter_dir / f".{slug}.partial.{output_format}"
+            merger.merge_wav_files(
+                input_files=input_files,
+                output_path=str(partial_path),
+                format=output_format,
+                cleanup_chunks=False,
+            )
+            os.replace(partial_path, final_path)
+            duration = _audio_file_duration(final_path) or sum(
+                float(row.get("duration_seconds") or 0)
+                for row in ready_rows
+            )
+            final_chapter = next(
+                item
+                for item in streaming_store.list_chapters(
+                    job_id,
+                    include_segments=False,
+                )
+                if int(item["chapter_index"]) == chapter_index
+            )
+            streaming_store.update_chapter(
+                job_id,
+                chapter_index,
+                state="ready",
+                ready_segments=len(ready_rows),
+                playable_seconds=duration,
+                duration_seconds=duration,
+                relative_path=final_path.relative_to(job_dir).as_posix(),
+                priority=0,
+                error=None,
+                render_seconds=base_render
+                + max(0.001, time.monotonic() - chapter_started),
+                qwen_seconds=metrics["qwen"],
+                rvc_seconds=metrics["rvc"],
+                overlap_seconds=float(
+                    final_chapter.get("overlap_seconds") or 0
+                ),
+                peak_memory_mb=metrics["peak"],
+                current_batch_size=current_batch_size,
+            )
+            _persist_chunks_metadata(job_id, job_dir)
+            _publish_streaming_metadata(
+                job_id,
+                job_dir,
+                output_format=output_format,
+            )
+            _sync_streaming_job_summary(job_id, force=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
+    except JobPaused:
+        with queue_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["status"] = "paused"
+                jobs[job_id]["paused_at"] = datetime.now().isoformat()
+                jobs[job_id]["streaming_phase"] = "paused"
+        _sync_streaming_job_summary(job_id, force=True)
+    except JobCancelled:
+        with queue_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["status"] = "cancelled"
+                jobs[job_id]["streaming_phase"] = "cancelled"
+        _sync_streaming_job_summary(job_id, force=True)
+    except Exception as exc:
+        active_index = int(
+            (jobs.get(job_id) or {}).get("active_chapter_index") or 0
+        )
+        active_chapter = next(
+            (
+                chapter
+                for chapter in streaming_store.list_chapters(
+                    job_id,
+                    include_segments=False,
+                )
+                if int(chapter["chapter_index"]) == active_index
+            ),
+            {},
+        )
+        attempts = int(active_chapter.get("attempts") or 0)
+        will_retry = (
+            _is_retryable_streaming_error(exc)
+            or _is_batch_pressure_error(exc)
+        ) and attempts < 3
+        failed_segment = next(
+            (
+                segment
+                for segment in streaming_store.list_segments(
+                    job_id,
+                    active_index,
+                )
+                if segment.get("state") != "ready"
+            ),
+            None,
+        )
+        if failed_segment:
+            streaming_store.update_segment(
+                job_id,
+                active_index,
+                int(failed_segment["segment_index"]),
+                state="pending" if will_retry else "failed",
+                attempts=int(failed_segment.get("attempts") or 0) + 1,
+                error=f"正在重试：{exc}" if will_retry else str(exc),
+            )
+        if will_retry:
+            streaming_store.update_chapter(
+                job_id,
+                active_index,
+                state="pending",
+                error=f"片段生成失败，正在自动重试（{attempts}/3）：{exc}",
+            )
+            with queue_lock:
+                entry = jobs.get(job_id)
+                if entry is not None:
+                    entry["status"] = "queued"
+                    entry["error"] = None
+                    entry["streaming_phase"] = "retrying"
+                    retry_payload = _build_job_data_from_entry(job_id, entry)
+                else:
+                    retry_payload = None
+            if retry_payload is not None:
+                job_queue.put(retry_payload)
+                _persist_job_state(job_id, force=True)
+                return
+        streaming_store.update_chapter(
+            job_id,
+            active_index,
+            state="failed",
+            error=str(exc),
+        )
+        with queue_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["error"] = str(exc)
+                jobs[job_id]["streaming_phase"] = "failed"
+        _sync_streaming_job_summary(job_id, force=True)
+        raise
+    finally:
+        elapsed = max(0.0, time.monotonic() - started)
+        with queue_lock:
+            if jobs.get(job_id):
+                jobs[job_id]["timing_metrics"] = {
+                    **(jobs[job_id].get("timing_metrics") or {}),
+                    "total_seconds": round(elapsed, 1),
+                }
+        cancel_flags.pop(job_id, None)
+        cancel_events.pop(job_id, None)
+        if (jobs.get(job_id) or {}).get("status") != "paused":
+            pause_flags.pop(job_id, None)
+
+
+def process_streaming_audio_job(job_data: Dict[str, Any]) -> None:
+    """Route old jobs unchanged and enable the v2 pipeline only for new jobs."""
+    if int(job_data.get("streaming_pipeline_version") or 1) >= 2:
+        _process_streaming_audio_job_v2(job_data)
+        return
+    _process_streaming_audio_job_legacy(job_data)
+
+
 
 def process_audio_job(job_data):
     """Process a single audio generation job"""
@@ -3543,7 +5998,7 @@ def process_audio_job(job_data):
         # Check for cancellation
         if cancel_flags.get(job_id, False):
             raise JobCancelled()
-        
+
         review_mode = bool(job_data.get('review_mode', False))
         merge_options_override = job_data.get('merge_options') or {}
         processor = _create_text_processor_for_engine(config.get("tts_engine"), config["chunk_size"], config)
@@ -3834,6 +6289,11 @@ def process_audio_job(job_data):
                 "speaker": segment.get("speaker"),
                 "engine": engine_name,
                 "emotion": segment.get("emotion"),
+                "emotion_label": segment.get("emotion_label"),
+                "emotion_source": segment.get("emotion_source"),
+                "emotion_confidence": segment.get("emotion_confidence"),
+                "emotion_reason": segment.get("emotion_reason"),
+                "emotion_driver": segment.get("emotion_driver"),
                 "text": segment.get("text"),
                 "file_path": file_path,
                 "relative_file": os.path.relpath(file_path, job_dir),
@@ -3891,13 +6351,28 @@ def process_audio_job(job_data):
                 "authors note",
                 "author's note",
             }
-            if normalized in non_chapter_sections:
-                fallback = normalized.replace("'", "").replace(" ", "-") or "section"
+            chinese_non_chapter_sections = {
+                "序章": "prologue", "楔子": "opening", "序言": "preface",
+                "前言": "foreword", "后记": "afterword", "尾声": "epilogue",
+                "番外": "extra",
+            }
+            chinese_special = next(
+                (fallback for heading, fallback in chinese_non_chapter_sections.items()
+                 if normalized.startswith(heading)),
+                None,
+            )
+            if normalized in non_chapter_sections or chinese_special:
+                fallback = (
+                    chinese_special
+                    or normalized.replace("'", "").replace(" ", "-")
+                    or "section"
+                )
                 folder_name = slugify_filename(title, fallback).lower()
                 return base_dir / folder_name, chapter_folder_idx, False, folder_name
 
             chapter_like = re.match(
-                r"^(chapter|book|part|section|letter)\b",
+                rf"^(?:(chapter|book|part|section|letter)\b|"
+                rf"第\s*[{CHINESE_NUMERAL_PATTERN}]+\s*(?:卷|部|章|节|回|篇))",
                 normalized,
                 flags=re.IGNORECASE,
             )
@@ -4047,6 +6522,8 @@ def process_audio_job(job_data):
             from src.engines.index_tts_engine import IndexTTSEngine  # noqa: F401
             if not isinstance(engine, (IndexTTSEngine, DotsTTSEngine)):
                 return
+            if isinstance(engine, IndexTTSEngine):
+                engine.ensure_persona_voice_locks(voice_assignments)
 
             engine_label = getattr(engine, "name", engine.__class__.__name__)
             logger.info("Job %s: %s batch mode — pre-collecting all chapters into one subprocess", job_id, engine_label)
@@ -4139,6 +6616,7 @@ def process_audio_job(job_data):
                         all_chunk_meta.append({
                             "speaker": speaker,
                             "text": chunk_text,
+                            "emotion": segment.get("emotion"),
                             "segment_index": seg_idx,
                             "chunk_index": local_idx,
                             "chapter_index": ch_idx,
@@ -4897,6 +7375,45 @@ def start_worker_thread():
         logger.info("Worker thread started")
 
 
+def _auto_resume_streaming_jobs_after_restart() -> int:
+    """Requeue durable streaming jobs that were active when the app stopped.
+
+    `streaming_store.recover_interrupted()` has already turned only in-flight
+    segment rows back to ``pending``. Ready rows keep their finalized file
+    paths, so the resumed worker generates only the missing portion. Explicitly
+    paused, cancelled, failed and completed jobs are intentionally excluded.
+    """
+    if not bool(load_config().get("streaming_auto_resume_after_restart", True)):
+        return 0
+
+    recovered: List[tuple[str, Dict[str, Any]]] = []
+    with queue_lock:
+        for job_id, entry in jobs.items():
+            if not entry.get("streaming_mode"):
+                continue
+            if entry.get("status") not in {"interrupted", "buffered"}:
+                continue
+            entry.update(
+                {
+                    "status": "queued",
+                    "paused_at": None,
+                    "interrupted_at": None,
+                    "streaming_phase": "recovering",
+                    "error": None,
+                }
+            )
+            recovered.append((job_id, _build_job_data_from_entry(job_id, entry)))
+
+    if not recovered:
+        return 0
+    start_worker_thread()
+    for job_id, job_data in recovered:
+        job_queue.put(job_data)
+        _persist_job_state(job_id, force=True)
+    logger.info("Auto-resumed %s interrupted streaming job(s)", len(recovered))
+    return len(recovered)
+
+
 def load_config():
     """Load configuration from file"""
     config = DEFAULT_CONFIG.copy()
@@ -4906,6 +7423,28 @@ def load_config():
                 data = json.load(f)
             if isinstance(data, dict):
                 config.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
+                if not IS_APPLE_SILICON:
+                    # The checked-in Mac config may contain MLX-community
+                    # repository IDs. Select this platform's PyTorch defaults
+                    # in memory; do not rewrite the user's config file.
+                    for key in (
+                        "qwen3_custom_model_id",
+                        "qwen3_custom_clone_model_id",
+                        "qwen3_clone_model_id",
+                        "qwen3_voice_design_model_id",
+                    ):
+                        configured_model = str(config.get(key) or "")
+                        platform_default = str(DEFAULT_CONFIG.get(key) or "")
+                        if (
+                            configured_model.startswith("mlx-community/")
+                            and platform_default.startswith("Qwen/")
+                        ):
+                            logger.info(
+                                "Using platform-compatible Qwen3 model for %s: %s",
+                                key,
+                                platform_default,
+                            )
+                            config[key] = platform_default
         except Exception as exc:
             logger.warning(f"Failed to load config.json, using defaults: {exc}")
     return config
@@ -4939,10 +7478,39 @@ def save_config(config):
         json.dump(merged, f, indent=2)
 
 
+REACT_APP_INDEX = Path(__file__).resolve().parent / "static" / "app" / "index.html"
+
+
+def _render_react_app():
+    """Serve the compiled React shell while keeping a safe development fallback."""
+    if REACT_APP_INDEX.is_file():
+        return send_file(REACT_APP_INDEX, mimetype="text/html", max_age=0)
+    return render_template('legacy.html')
+
+
 @app.route('/')
 def index():
-    """Main page"""
-    return render_template('index.html')
+    """React workbench entry point."""
+    return _render_react_app()
+
+
+@app.route('/legacy')
+def legacy_index():
+    """Temporary escape hatch during the React migration."""
+    return render_template('legacy.html')
+
+
+@app.route('/projects')
+@app.route('/projects/<path:_subpath>')
+@app.route('/tasks')
+@app.route('/library')
+@app.route('/discover')
+@app.route('/voices')
+@app.route('/settings')
+@app.route('/help')
+def react_client_route(_subpath: str | None = None):
+    """Allow React Router deep links to survive browser refreshes."""
+    return _render_react_app()
 
 
 def _load_chatterbox_voice_entries() -> List[Dict[str, Any]]:
@@ -5090,6 +7658,9 @@ def _serialize_chatterbox_voice(entry: Dict[str, Any]) -> Dict[str, Any]:
         "gender": entry.get("gender"),  # Male, Female, or None
         "language": entry.get("language"),  # Language code like en-US
         "description": entry.get("description"),
+        "instruct": entry.get("instruct"),
+        "preset_id": entry.get("preset_id"),
+        "acting_state": entry.get("acting_state"),
         "archived": bool(entry.get("archived", False)),
         "source": "local",  # local voices vs external
     }
@@ -5395,22 +7966,86 @@ def _apply_voice_design_cleanup(audio_data, sample_rate: int):
 
 def _generate_voice_design_preview(payload: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, str]:
     text = (payload.get("text") or "").strip()
-    instruct = (payload.get("instruct") or "").strip()
-    language = (payload.get("language") or "Auto").strip() or "Auto"
+    custom_instruct = (payload.get("instruct") or "").strip()
+    preset_id = (payload.get("preset_id") or "").strip()
+    acting_state = (payload.get("acting_state") or "").strip()
+    language = (payload.get("language") or "Chinese").strip() or "Chinese"
     if not text:
         raise ValueError("Text is required to generate a preview.")
+    # VoiceDesign requires a useful description.  Chinese requests always keep
+    # the native-Mandarin fluency baseline, even for a fully custom voice.
+    if preset_id or language.lower() in {"chinese", "zh", "zh-cn", "auto"}:
+        instruct = compose_voice_instruction(
+            preset_id or None,
+            acting_state=acting_state or None,
+            custom_instruction=custom_instruct or None,
+        )
+    else:
+        instruct = custom_instruct
+    if not instruct:
+        raise ValueError("Voice style instruction is required.")
 
     with gpu_inference_lock:
         model = _get_qwen3_voice_design_model(config)
-        wavs, sr = model.generate_voice_design(
-            text=text,
-            instruct=instruct or "",
-            language=language or "Auto",
-            non_streaming_mode=True,
-        )
-    if not wavs:
-        raise RuntimeError("No audio produced for preview.")
-    audio_data = _apply_voice_design_cleanup(wavs[0], int(sr))
+        if qwen3_voice_design_backend == "mlx":
+            import numpy as np
+
+            results = list(model.generate(
+                text=text,
+                instruct=instruct,
+                lang_code=language.lower(),
+                verbose=False,
+            ))
+            if not results:
+                raise RuntimeError("No audio produced for preview.")
+            audio_parts = [
+                np.asarray(result.audio, dtype=np.float32).reshape(-1)
+                for result in results
+            ]
+            audio_data = (
+                np.concatenate(audio_parts)
+                if len(audio_parts) > 1
+                else audio_parts[0]
+            )
+            sr = int(
+                getattr(results[0], "sample_rate", None)
+                or getattr(model, "sample_rate", 24000)
+            )
+            if has_abnormally_slow_delivery(text, len(audio_data), sr):
+                logger.warning("VoiceDesign preview was abnormally slow; retrying once.")
+                retry_results = list(model.generate(
+                    text=text,
+                    instruct=instruct + PACING_RETRY_INSTRUCTION,
+                    lang_code=language.lower(),
+                    verbose=False,
+                ))
+                if retry_results:
+                    retry_parts = [
+                        np.asarray(result.audio, dtype=np.float32).reshape(-1)
+                        for result in retry_results
+                    ]
+                    retry_audio = (
+                        np.concatenate(retry_parts)
+                        if len(retry_parts) > 1
+                        else retry_parts[0]
+                    )
+                    if len(retry_audio) < len(audio_data):
+                        audio_data = retry_audio
+                        sr = int(
+                            getattr(retry_results[0], "sample_rate", None)
+                            or getattr(model, "sample_rate", sr)
+                        )
+        else:
+            wavs, sr = model.generate_voice_design(
+                text=text,
+                instruct=instruct,
+                language=language,
+                non_streaming_mode=True,
+            )
+            if not wavs:
+                raise RuntimeError("No audio produced for preview.")
+            audio_data = wavs[0]
+    audio_data = _apply_voice_design_cleanup(audio_data, int(sr))
     buffer = io.BytesIO()
     sf.write(buffer, audio_data, int(sr), format="wav")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -5426,6 +8061,9 @@ def _save_voice_design_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     gender = (payload.get("gender") or "").strip() or None
     language = (payload.get("language") or "Auto").strip() or "Auto"
     description = (payload.get("description") or "").strip() or None
+    instruct = (payload.get("instruct") or "").strip() or None
+    preset_id = (payload.get("preset_id") or "").strip() or None
+    acting_state = (payload.get("acting_state") or "").strip() or None
     audio_base64 = payload.get("audio_base64")
 
     if not name:
@@ -5440,7 +8078,9 @@ def _save_voice_design_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         raise ValueError("Invalid audio payload.") from exc
 
-    slug = _slugify_filename(name)
+    # Preset IDs are ASCII and stable across platforms; Chinese display names
+    # otherwise collapse to a generic "voice" filename.
+    slug = _slugify_filename(preset_id or name)
     target_path = VOICE_PROMPT_DIR / f"{slug}.wav"
     counter = 1
     while target_path.exists():
@@ -5473,6 +8113,9 @@ def _save_voice_design_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "gender": gender,
         "language": language if language and language != "Auto" else None,
         "description": description,
+        "instruct": instruct,
+        "preset_id": preset_id,
+        "acting_state": acting_state,
     }
     entries.append(entry)
     _save_chatterbox_voice_entries(entries)
@@ -6286,6 +8929,12 @@ def _serialize_chunk_for_response(job_id: str, chunk: Dict[str, Any]) -> Dict[st
         "regenerated_at": chunk.get("regenerated_at"),
         "voice": chunk.get("voice_label"),
         "voice_assignment": chunk.get("voice_assignment"),
+        "emotion": chunk.get("emotion"),
+        "emotion_label": chunk.get("emotion_label"),
+        "emotion_source": chunk.get("emotion_source"),
+        "emotion_confidence": chunk.get("emotion_confidence"),
+        "emotion_reason": chunk.get("emotion_reason"),
+        "emotion_driver": chunk.get("emotion_driver"),
     }
 
 
@@ -6297,7 +8946,8 @@ def get_job_chunks(job_id: str):
             job_entry = jobs.get(job_id)
             if not job_entry:
                 return jsonify({"success": False, "error": "Job not found"}), 404
-            _ensure_review_ready(job_entry)
+            if not job_entry.get("streaming_mode"):
+                _ensure_review_ready(job_entry)
             chunks = [dict(item) for item in (job_entry.get("chunks") or [])]
             regen_tasks = copy.deepcopy(job_entry.get("regen_tasks") or {})
             review_status = {
@@ -6305,7 +8955,8 @@ def get_job_chunks(job_id: str):
                 "chapter_mode": job_entry.get("chapter_mode"),
                 "full_story_requested": job_entry.get("full_story_requested"),
                 "has_active_regen": _has_active_regen_tasks(job_entry),
-                "engine": job_entry.get("engine"),
+                "engine": _effective_job_engine(job_entry),
+                "streaming_mode": bool(job_entry.get("streaming_mode")),
             }
 
         payload = {
@@ -6318,6 +8969,762 @@ def get_job_chunks(job_id: str):
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("Failed to load chunks for job %s: %s", job_id, exc, exc_info=True)
         return jsonify({"success": False, "error": "Failed to load job chunks"}), 500
+
+
+def _streaming_chapter_response(
+    job_id: str,
+    chapter: Dict[str, Any],
+    *,
+    include_segments: bool,
+) -> Dict[str, Any]:
+    state = str(chapter.get("state") or "pending")
+    relative_path = chapter.get("relative_path")
+    legacy_relative_path = chapter.get("legacy_relative_path")
+    published_relative_path = (
+        relative_path
+        if state == "ready" and relative_path
+        else legacy_relative_path
+    )
+    total_segments = int(chapter.get("total_segments") or 0)
+    ready_segments = int(chapter.get("ready_segments") or 0)
+    segment_rows = list(chapter.get("segments") or [])
+    qwen_ready_segments = sum(
+        1
+        for segment in segment_rows
+        if segment.get("state") in {"converting", "ready"}
+    )
+    narrator_segments = [
+        segment
+        for segment in segment_rows
+        if segment.get("gender") == "narrator"
+    ]
+    rvc_ready_segments = sum(
+        1
+        for segment in narrator_segments
+        if segment.get("state") == "ready"
+    )
+    payload = {
+        "index": int(chapter["chapter_index"]),
+        "title": chapter.get("title") or f"第 {int(chapter['chapter_index']) + 1} 章",
+        "state": state,
+        "total_segments": total_segments,
+        "ready_segments": ready_segments,
+        "playable_seconds": float(chapter.get("playable_seconds") or 0),
+        "duration_seconds": float(chapter.get("duration_seconds") or 0),
+        "render_seconds": float(chapter.get("render_seconds") or 0),
+        "production_ratio": float(chapter.get("production_ratio") or 0),
+        "qwen_stage": {
+            "ready_segments": qwen_ready_segments,
+            "total_segments": total_segments,
+            "progress": (
+                int((qwen_ready_segments / total_segments) * 100)
+                if total_segments
+                else 0
+            ),
+        },
+        "rvc_stage": {
+            "ready_segments": rvc_ready_segments,
+            "total_segments": len(narrator_segments),
+            "progress": (
+                int((rvc_ready_segments / len(narrator_segments)) * 100)
+                if narrator_segments
+                else 100
+            ),
+        },
+        "batch_metrics": {
+            "current_batch_size": int(
+                chapter.get("current_batch_size") or 1
+            ),
+            "qwen_seconds": float(chapter.get("qwen_seconds") or 0),
+            "rvc_seconds": float(chapter.get("rvc_seconds") or 0),
+            "overlap_seconds": float(chapter.get("overlap_seconds") or 0),
+            "peak_memory_mb": float(chapter.get("peak_memory_mb") or 0),
+        },
+        "progress": int((ready_segments / total_segments) * 100) if total_segments else 0,
+        "can_play": state in {"streamable", "ready"} or bool(legacy_relative_path),
+        "file_url": (
+            _chunk_file_url(job_id, published_relative_path)
+            if published_relative_path
+            else None
+        ),
+        "playback_version": (
+            "speaker-pipeline-v3"
+            if state == "ready" and relative_path
+            else ("legacy-v2" if legacy_relative_path else None)
+        ),
+        "generation_version": int(chapter.get("generation_version") or 2),
+        "recast_state": chapter.get("recast_state"),
+        "error": chapter.get("error"),
+        "attempts": int(chapter.get("attempts") or 0),
+        "priority": int(chapter.get("priority") or 0),
+        "updated_at": chapter.get("updated_at"),
+        "segments": [],
+    }
+    if include_segments:
+        for segment in chapter.get("segments") or []:
+            segment_path = segment.get("relative_path")
+            payload["segments"].append(
+                {
+                    "index": int(segment["segment_index"]),
+                    "speaker": segment.get("speaker"),
+                    "character_id": segment.get("character_id"),
+                    "gender": segment.get("gender") or "neutral",
+                    "emotion": segment.get("emotion"),
+                    "state": segment.get("state") or "pending",
+                    "duration_seconds": float(segment.get("duration_seconds") or 0),
+                    "render_seconds": float(segment.get("render_seconds") or 0),
+                    "qwen_seconds": float(segment.get("qwen_seconds") or 0),
+                    "rvc_seconds": float(segment.get("rvc_seconds") or 0),
+                    "batch_size": int(segment.get("batch_size") or 1),
+                    "peak_memory_mb": float(
+                        segment.get("peak_memory_mb") or 0
+                    ),
+                    "source_start": segment.get("source_start"),
+                    "source_end": segment.get("source_end"),
+                    "attribution_label": segment.get("attribution_label"),
+                    "attribution_source": segment.get("attribution_source"),
+                    "attribution_confidence": float(
+                        segment.get("attribution_confidence") or 0
+                    ),
+                    "scene_id": segment.get("scene_id"),
+                    "speaker_role": segment.get("speaker_role"),
+                    "generation_version": int(segment.get("generation_version") or 2),
+                    "inference_evidence": segment.get("inference_evidence") or {},
+                    "converted": bool(segment.get("converted")),
+                    "warning": segment.get("warning"),
+                    "attempts": int(segment.get("attempts") or 0),
+                    "file_url": (
+                        _chunk_file_url(job_id, segment_path)
+                        if segment.get("state") == "ready" and segment_path
+                        else None
+                    ),
+                }
+            )
+    return payload
+
+
+def _wake_streaming_job(job_id: str) -> bool:
+    """Queue a parked streaming job once without duplicating work."""
+    start_worker_thread()
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if not entry or not entry.get("streaming_mode"):
+            return False
+        if entry.get("status") in {
+            "queued",
+            "processing",
+            "pausing",
+            "paused",
+            "cancelled",
+            "deleted",
+            "completed",
+        }:
+            return False
+        pause_flags.pop(job_id, None)
+        entry["status"] = "queued"
+        entry["error"] = None
+        job_data = _build_job_data_from_entry(job_id, entry)
+    job_queue.put(job_data)
+    _persist_job_state(job_id, force=True)
+    return True
+
+
+@app.route('/api/jobs/<job_id>/chapters', methods=['GET'])
+def get_streaming_job_chapters(job_id: str):
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Job not found"}), 404
+        if not entry.get("streaming_mode"):
+            return jsonify({"success": False, "error": "Job is not a streaming job"}), 409
+        job_status = entry.get("status")
+        warning = entry.get("streaming_warning")
+        phase = entry.get("streaming_phase")
+        config_snapshot = dict(entry.get("config_snapshot") or {})
+
+    requested_index = request.args.get("chapter")
+    try:
+        requested_index_int = int(requested_index) if requested_index is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "Invalid chapter index"}), 400
+    playback = streaming_store.get_playback(job_id)
+    active_index = (
+        requested_index_int
+        if requested_index_int is not None
+        else int(playback.get("chapter_index") or 0)
+    )
+    chapters = streaming_store.list_chapters(job_id, include_segments=True)
+    rvc_status = rvc_service.status(
+        _hydrate_config_secrets(config_snapshot or load_config())
+    )
+    if (
+        warning
+        and rvc_status.get("available")
+        and "模型尚未安装" in str(warning)
+    ):
+        warning = "这项旧任务当时使用了狐系旁白；新任务已启用八重声线"
+    if not phase and chapters and all(
+        chapter.get("state") == "ready" for chapter in chapters
+    ):
+        phase = "ready"
+    return jsonify(
+        {
+            "success": True,
+            "job_id": job_id,
+            "status": job_status,
+            "phase": phase,
+            "warning": warning,
+            "rvc": rvc_status,
+            "summary": streaming_store.summary(job_id),
+            "playback": playback,
+            "chapters": [
+                _streaming_chapter_response(
+                    job_id,
+                    chapter,
+                    include_segments=int(chapter["chapter_index"]) == active_index,
+                )
+                for chapter in chapters
+            ],
+        }
+    )
+
+
+@app.route('/api/jobs/<job_id>/characters', methods=['GET'])
+def get_streaming_job_characters(job_id: str):
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Job not found"}), 404
+        if not entry.get("streaming_mode"):
+            return jsonify({
+                "success": False,
+                "error": "Job is not a streaming job",
+            }), 409
+    characters = streaming_store.list_characters(job_id)
+    return jsonify({
+        "success": True,
+        "job_id": job_id,
+        "characters": characters,
+        "protagonists": [
+            character
+            for character in characters
+            if character.get("is_protagonist")
+        ],
+    })
+
+
+@app.route(
+    '/api/jobs/<job_id>/characters/<character_id>',
+    methods=['PATCH'],
+)
+def update_streaming_job_character(job_id: str, character_id: str):
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Job not found"}), 404
+        if not entry.get("streaming_mode"):
+            return jsonify({
+                "success": False,
+                "error": "Job is not a streaming job",
+            }), 409
+    current = streaming_store.get_character(job_id, character_id)
+    if not current:
+        return jsonify({"success": False, "error": "Character not found"}), 404
+    data = request.get_json(silent=True) or {}
+    updates: Dict[str, Any] = {}
+    if "name" in data:
+        name = str(data.get("name") or "").strip()
+        if not name or len(name) > 40:
+            return jsonify({
+                "success": False,
+                "error": "Character name must be between 1 and 40 characters",
+            }), 400
+        updates["name"] = name
+    if "aliases" in data:
+        if not isinstance(data.get("aliases"), list):
+            return jsonify({
+                "success": False,
+                "error": "Aliases must be a list",
+            }), 400
+        aliases = []
+        for alias in data["aliases"][:20]:
+            normalized = str(alias or "").strip()
+            if normalized and len(normalized) <= 40 and normalized not in aliases:
+                aliases.append(normalized)
+        effective_name = updates.get("name") or current["name"]
+        if effective_name not in aliases:
+            aliases.insert(0, effective_name)
+        updates["aliases"] = aliases
+    if "gender" in data:
+        gender = str(data.get("gender") or "").strip().lower()
+        if gender not in {"male", "female", "neutral"}:
+            return jsonify({
+                "success": False,
+                "error": "Gender must be male, female, or neutral",
+            }), 400
+        updates["gender"] = gender
+    if "role_tier" in data:
+        role_tier = str(data.get("role_tier") or "").strip().lower()
+        if role_tier not in {"lead", "recurring", "extra"}:
+            return jsonify({
+                "success": False,
+                "error": "Role tier must be lead, recurring, or extra",
+            }), 400
+        updates["role_tier"] = role_tier
+    if "voice_locked" in data:
+        updates["voice_locked"] = bool(data.get("voice_locked"))
+    if "voice" in data:
+        voice = str(data.get("voice") or "").strip()
+        preset = get_voice_preset(voice) if voice else None
+        if voice and not preset:
+            return jsonify({
+                "success": False,
+                "error": "Unknown voice preset",
+            }), 400
+        effective_gender = updates.get("gender") or current.get("gender")
+        preset_gender = str((preset or {}).get("gender") or "").lower()
+        if (
+            voice
+            and effective_gender in {"male", "female"}
+            and preset_gender != effective_gender
+        ):
+            return jsonify({
+                "success": False,
+                "error": "Voice gender does not match the character gender",
+            }), 400
+        updates["voice"] = voice
+    if "gender" in updates and "voice" not in updates:
+        current_voice = str(current.get("voice") or "")
+        current_preset = get_voice_preset(current_voice) if current_voice else None
+        current_voice_gender = str(
+            (current_preset or {}).get("gender") or ""
+        ).lower()
+        if (
+            current_voice
+            and updates["gender"] in {"male", "female"}
+            and current_voice_gender != updates["gender"]
+        ):
+            return jsonify({
+                "success": False,
+                "error": "Choose a matching voice when changing character gender",
+            }), 400
+    updated = streaming_store.update_character(
+        job_id,
+        character_id,
+        **updates,
+    )
+    if updated and ("voice" in updates or "gender" in updates):
+        with queue_lock:
+            entry = jobs.get(job_id)
+            if entry is not None:
+                assignments = entry.setdefault("voice_assignments", {})
+                assignment = assignments.setdefault(character_id, {})
+                if updates.get("voice"):
+                    assignment["voice"] = updates["voice"]
+                assignment.setdefault("extra", {}).setdefault(
+                    "language",
+                    "Chinese",
+                )
+                entry["job_payload"] = _build_job_payload(
+                    job_id,
+                    _load_job_text(entry.get("text_path")),
+                    entry,
+                )
+        _persist_job_state(job_id, force=True)
+    if updated and int((jobs.get(job_id) or {}).get("streaming_pipeline_version") or 1) >= 3:
+        all_segments = [
+            segment
+            for chapter in streaming_store.list_chapters(job_id, include_segments=True)
+            for segment in (chapter.get("segments") or [])
+        ]
+        tagged_speakers = "".join(
+            f"[{segment.get('speaker')}]x[/{segment.get('speaker')}]"
+            for segment in all_segments
+            if segment.get("speaker")
+        )
+        with queue_lock:
+            existing_assignments = copy.deepcopy(
+                (jobs.get(job_id) or {}).get("voice_assignments") or {}
+            )
+        rebuilt_assignments = build_streaming_voice_assignments(
+            tagged_speakers,
+            existing_assignments,
+            speaker_genders={
+                str(segment.get("speaker") or ""): str(segment.get("gender") or "neutral")
+                for segment in all_segments
+            },
+        )
+        rebuilt_audit = audit_streaming_cast(
+            streaming_store.list_characters(job_id),
+            all_segments,
+            rebuilt_assignments,
+        )
+        streaming_store.save_cast_audit(job_id, rebuilt_audit)
+        with queue_lock:
+            if jobs.get(job_id) is not None:
+                jobs[job_id]["voice_assignments"] = rebuilt_assignments
+                jobs[job_id]["cast_audit"] = rebuilt_audit
+    return jsonify({
+        "success": True,
+        "character": updated,
+        "applies_to": "pending_segments_only",
+    })
+
+
+@app.route('/api/jobs/<job_id>/cast-audit', methods=['GET'])
+def get_streaming_cast_audit(job_id: str):
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Job not found"}), 404
+        if not entry.get("streaming_mode"):
+            return jsonify({"success": False, "error": "Job is not a streaming job"}), 409
+    audit = streaming_store.get_cast_audit(job_id)
+    if audit is None:
+        return jsonify({
+            "success": True,
+            "job_id": job_id,
+            "status": "not_analyzed",
+            "ready": False,
+            "pipeline_version": int(entry.get("streaming_pipeline_version") or 1),
+        })
+    return jsonify({"success": True, "job_id": job_id, **audit})
+
+
+@app.route('/api/jobs/<job_id>/recast', methods=['POST'])
+def recast_streaming_job(job_id: str):
+    """Build a V3 cast/scene plan while leaving every legacy audio file intact."""
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get("mode") or "reuse_verified").strip().lower()
+    if mode != "reuse_verified":
+        return jsonify({"success": False, "error": "Unsupported recast mode"}), 400
+
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Job not found"}), 404
+        if not entry.get("streaming_mode"):
+            return jsonify({"success": False, "error": "Job is not a streaming job"}), 409
+        if entry.get("status") not in {"paused", "interrupted", "failed", "buffered"}:
+            return jsonify({
+                "success": False,
+                "error": "请先暂停任务，等待当前片段安全落盘后再重建人物",
+            }), 409
+        entry_snapshot = copy.deepcopy(entry)
+
+    source_text_path = entry_snapshot.get("source_text_path") or (
+        entry_snapshot.get("job_payload") or {}
+    ).get("source_text_path")
+    source_text = _load_job_text(source_text_path)
+    if not source_text:
+        return jsonify({"success": False, "error": "原始 source.txt 不存在"}), 409
+
+    config = _hydrate_config_secrets(
+        entry_snapshot.get("config_snapshot") or load_config()
+    )
+    section_headings = entry_snapshot.get("section_headings")
+    old_characters = streaming_store.list_characters(job_id)
+    old_chapters = streaming_store.list_chapters(job_id, include_segments=True)
+    old_segments = [
+        segment
+        for chapter in old_chapters
+        for segment in (chapter.get("segments") or [])
+    ]
+
+    sections, characters = _analyze_streaming_cast_v3(
+        source_text,
+        section_headings,
+        config,
+        cached_characters=old_characters,
+    )
+    processor = _create_text_processor_for_engine(
+        "qwen3_custom",
+        int(config.get("chunk_size") or 500),
+        config,
+    )
+    word_replacements = entry_snapshot.get("word_replacements") or []
+    chapter_plans: Dict[int, List[Dict[str, Any]]] = {}
+    tagged_sections: List[str] = []
+    for section in sections:
+        chapter_index = int(section["index"])
+        detail = tag_chinese_dialogue_detailed(
+            section.get("content") or "",
+            characters,
+            scene_key=f"chapter-{chapter_index}",
+        )
+        tagged_content = (
+            detail.tagged_text
+            if detail
+            else f"[narrator]{section.get('content') or ''}[/narrator]"
+        )
+        tagged_sections.append(tagged_content)
+        chapter_plans[chapter_index] = _flatten_streaming_segments(
+            processor,
+            tagged_content,
+            word_replacements,
+            source_text=section.get("content") or "",
+            source_base=int(section.get("source_start") or 0),
+            attributions=detail.attributions if detail else [],
+            chapter_index=chapter_index,
+            generation_version=3,
+        )
+
+    supplied_assignments = copy.deepcopy(entry_snapshot.get("voice_assignments") or {})
+    for character in characters:
+        character_id = str(character.get("character_id") or "")
+        voice = str(character.get("voice") or "")
+        if character_id and voice:
+            supplied_assignments.setdefault(character_id, {})["voice"] = voice
+    tagged_book = "\n".join(tagged_sections)
+    flat_plans = [segment for plan in chapter_plans.values() for segment in plan]
+    assignments = build_streaming_voice_assignments(
+        tagged_book,
+        supplied_assignments,
+        speaker_genders={
+            str(segment.get("speaker") or ""): str(segment.get("gender") or "neutral")
+            for segment in flat_plans
+        },
+    )
+    audit = audit_streaming_cast(characters, flat_plans, assignments)
+
+    job_root = OUTPUT_DIR / job_id
+    legacy_dir = job_root / "legacy-v2"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = legacy_dir / "recast-manifest.json"
+    if not manifest_path.exists():
+        _atomic_json_write(
+            manifest_path,
+            {
+                "job_id": job_id,
+                "created_at": datetime.now().isoformat(),
+                "source": "speaker-pipeline-v2",
+                "target": "speaker-pipeline-v3",
+                "audio_files_moved": False,
+                "characters": old_characters,
+                "chapters": old_chapters,
+            },
+        )
+
+    old_su_ids = {
+        str(character.get("character_id") or "").lower()
+        for character in old_characters
+        if str(character.get("name") or "").strip() == "苏承"
+    }
+    new_su_ids = {
+        str(character.get("character_id") or "").lower()
+        for character in characters
+        if str(character.get("name") or "").strip() == "苏承"
+    }
+    reusable: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for segment in old_segments:
+        if segment.get("state") != "ready" or not segment.get("relative_path"):
+            continue
+        speaker = str(segment.get("speaker") or "").lower()
+        kind = "narrator" if speaker == "narrator" else (
+            "su" if speaker in old_su_ids | new_su_ids else ""
+        )
+        if not kind:
+            continue
+        relative_path = str(segment.get("relative_path"))
+        audio_path = job_root / relative_path
+        duration = _audio_file_duration(audio_path) if audio_path.is_file() else 0.0
+        if duration <= 0:
+            continue
+        content_hash = str(segment.get("content_hash") or "") or hashlib.sha256(
+            "".join(str(segment.get("text") or "").split()).encode("utf-8")
+        ).hexdigest()
+        reusable.setdefault((kind, content_hash), []).append({
+            **segment,
+            "duration_seconds": duration,
+            "relative_path": relative_path,
+        })
+
+    streaming_store.replace_characters(job_id, characters)
+    streaming_store.prepare_recast(
+        job_id,
+        sections,
+        chapter_plans,
+        generation_version=3,
+    )
+    reused_count = 0
+    reused_by_chapter: Dict[int, int] = {}
+    for segment in flat_plans:
+        speaker = str(segment.get("speaker") or "").lower()
+        kind = "narrator" if speaker == "narrator" else (
+            "su" if speaker in new_su_ids else ""
+        )
+        candidates = reusable.get((kind, str(segment.get("content_hash") or ""))) if kind else None
+        if not candidates:
+            continue
+        legacy = candidates[0]
+        chapter_index = int(segment.get("chapter_index") or 0)
+        streaming_store.update_segment(
+            job_id,
+            chapter_index,
+            int(segment["segment_index"]),
+            state="ready",
+            relative_path=legacy["relative_path"],
+            legacy_relative_path=legacy["relative_path"],
+            duration_seconds=float(legacy.get("duration_seconds") or 0),
+            render_seconds=0,
+            generation_version=3,
+            warning="复用 legacy-v2 已验证片段",
+            error=None,
+        )
+        reused_count += 1
+        reused_by_chapter[chapter_index] = reused_by_chapter.get(chapter_index, 0) + 1
+    for chapter_index, ready_segments in reused_by_chapter.items():
+        streaming_store.update_chapter(
+            job_id,
+            chapter_index,
+            ready_segments=ready_segments,
+            recast_state="reused_partial",
+        )
+    streaming_store.save_cast_audit(job_id, audit)
+
+    v3_dir = job_root / "v3"
+    v3_dir.mkdir(parents=True, exist_ok=True)
+    v3_text_path = v3_dir / "input.txt"
+    partial_text_path = v3_dir / ".input.txt.partial"
+    partial_text_path.write_text(tagged_book, encoding="utf-8")
+    os.replace(partial_text_path, v3_text_path)
+
+    pending_count = max(0, len(flat_plans) - reused_count)
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if entry is not None:
+            entry.update({
+                "status": "paused",
+                "streaming_phase": "cast_ready" if audit.get("ready") else "cast_review",
+                "streaming_pipeline_version": 3,
+                "cast_sampling": "full_book",
+                "allow_multiple_protagonists": True,
+                "cast_analysis_complete": True,
+                "cast_audit": audit,
+                "voice_assignments": assignments,
+                "text_path": str(v3_text_path),
+                "streaming_warning": None,
+                "recast": {
+                    "mode": mode,
+                    "legacy_version": "legacy-v2",
+                    "target_version": "speaker-pipeline-v3",
+                    "reused_segments": reused_count,
+                    "pending_segments": pending_count,
+                    "manifest": manifest_path.relative_to(job_root).as_posix(),
+                },
+            })
+            entry["job_payload"] = _build_job_payload(job_id, tagged_book, entry)
+    _persist_job_state(job_id, force=True)
+    return jsonify({
+        "success": True,
+        "job_id": job_id,
+        "status": "paused",
+        "phase": "cast_ready" if audit.get("ready") else "cast_review",
+        "reused_segments": reused_count,
+        "pending_segments": pending_count,
+        "manifest": manifest_path.relative_to(job_root).as_posix(),
+        "audit": audit,
+    })
+
+
+@app.route('/api/jobs/<job_id>/events', methods=['GET'])
+def stream_job_events(job_id: str):
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Job not found"}), 404
+        if not entry.get("streaming_mode"):
+            return jsonify({"success": False, "error": "Job is not a streaming job"}), 409
+
+    @stream_with_context
+    def generate_events():
+        previous_token = None
+        heartbeat_at = 0.0
+        while True:
+            with queue_lock:
+                current = jobs.get(job_id)
+                if not current or current.get("status") == "deleted":
+                    break
+                status = current.get("status")
+                phase = current.get("streaming_phase")
+                warning = current.get("streaming_warning")
+            token = streaming_store.snapshot_token(job_id)
+            now = time.monotonic()
+            if token != previous_token:
+                data = {
+                    "job_id": job_id,
+                    "status": status,
+                    "phase": phase,
+                    "warning": warning,
+                    "summary": streaming_store.summary(job_id),
+                }
+                yield f"event: progress\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                previous_token = token
+                heartbeat_at = now
+            elif now - heartbeat_at >= 15:
+                yield ": keep-alive\n\n"
+                heartbeat_at = now
+            time.sleep(0.75)
+
+    return Response(
+        generate_events(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route('/api/jobs/<job_id>/playback', methods=['POST'])
+def report_streaming_playback(job_id: str):
+    with queue_lock:
+        entry = jobs.get(job_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Job not found"}), 404
+        if not entry.get("streaming_mode"):
+            return jsonify({"success": False, "error": "Job is not a streaming job"}), 409
+    data = request.get_json(silent=True) or {}
+    try:
+        playback = streaming_store.update_playback(
+            job_id,
+            chapter_index=max(0, int(data.get("chapter_index") or 0)),
+            current_time=max(0.0, float(data.get("current_time") or 0)),
+            duration=max(0.0, float(data.get("duration") or 0)),
+            playback_rate=max(0.25, min(float(data.get("playback_rate") or 1), 4)),
+            state=str(data.get("state") or "idle"),
+        )
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "Invalid playback state"}), 400
+    woke = _wake_streaming_job(job_id)
+    return jsonify(
+        {
+            "success": True,
+            "playback": playback,
+            "worker_woken": woke,
+            "summary": streaming_store.summary(job_id),
+        }
+    )
+
+
+@app.route('/api/jobs/<job_id>/chapters/<int:chapter_index>/priority', methods=['POST'])
+def prioritize_streaming_chapter(job_id: str, chapter_index: int):
+    chapters = streaming_store.list_chapters(job_id, include_segments=False)
+    if not chapters:
+        return jsonify({"success": False, "error": "Streaming job not found"}), 404
+    if chapter_index < 0 or chapter_index >= len(chapters):
+        return jsonify({"success": False, "error": "Chapter index out of range"}), 404
+    streaming_store.prioritize(job_id, chapter_index)
+    woke = _wake_streaming_job(job_id)
+    return jsonify(
+        {
+            "success": True,
+            "chapter_index": chapter_index,
+            "worker_woken": woke,
+        }
+    )
+
+
+@app.route('/api/rvc/status', methods=['GET'])
+def get_rvc_status():
+    return jsonify({"success": True, **rvc_service.status(load_config())})
 
 
 @app.route('/api/jobs/<job_id>/review/regen', methods=['POST'])
@@ -7043,13 +10450,24 @@ def settings():
         config = load_config()
         return jsonify({
             "success": True,
-            "settings": config
+            # Settings are consumed by the local UI, but a device bearer token
+            # must never be exposed to JavaScript (or to the legacy cloud
+            # bridge).  The dedicated community status endpoint reports only
+            # the non-secret connection state.
+            "settings": _redact_config_secrets(config)
         })
     else:
         try:
-            new_settings = request.json
+            new_settings = request.json or {}
             config = load_config()
-            config.update(new_settings)
+            # A redacted GET must not turn into an accidental credential erase
+            # when the settings form posts its complete object back unchanged.
+            for key, value in new_settings.items():
+                if key not in DEFAULT_CONFIG:
+                    continue
+                if key in SECRET_CONFIG_KEYS and value in (None, ""):
+                    continue
+                config[key] = value
             save_config(config)
             
             return jsonify({
@@ -7062,6 +10480,114 @@ def settings():
                 "success": False,
                 "error": str(e)
             }), 400
+
+
+@app.route('/api/community/status', methods=['GET'])
+def community_status():
+    """Expose contribution state without ever returning the local device token."""
+    config = load_config()
+    job_id = (request.args.get("job_id") or "").strip() or None
+    return jsonify({
+        "success": True,
+        "enabled": CommunityLibraryClient.enabled(config),
+        "shared_enabled": bool(config.get("community_shared_enabled")),
+        "auto_contribute": bool(config.get("community_auto_contribute")),
+        "api_url": config.get("community_api_url") or "",
+        "device_id": config.get("community_device_id") or "",
+        "contributions": community_library.status(job_id),
+    })
+
+
+@app.route('/api/community/enable', methods=['POST'])
+def enable_community_library():
+    """One-time consent/enrolment; every later completed chapter uploads itself."""
+    data = request.get_json(silent=True) or {}
+    if data.get("accepted") is not True:
+        return jsonify({
+            "success": False,
+            "error": "请先确认共享书库告知。",
+        }), 400
+    config = load_config()
+    requested_url = str(data.get("api_url") or config.get("community_api_url") or "").strip().rstrip("/")
+    if not requested_url.startswith(("https://", "http://")):
+        return jsonify({
+            "success": False,
+            "error": "请输入有效的公共书库地址。",
+        }), 400
+    config["community_api_url"] = requested_url
+    try:
+        enrolled = community_library.enroll(
+            config,
+            display_name=str(data.get("device_name") or platform.node() or "声阅设备"),
+            public_key=str(data.get("public_key") or ""),
+        )
+        config.update(enrolled)
+        save_config(config)
+        return jsonify({
+            "success": True,
+            "enabled": True,
+            "device_id": enrolled.get("community_device_id"),
+        })
+    except Exception as exc:
+        logger.warning("Community library enrolment failed: %s", exc)
+        return jsonify({"success": False, "error": str(exc)}), 502
+
+
+@app.route('/api/community/disable', methods=['POST'])
+def disable_community_library():
+    config = load_config()
+    config["community_shared_enabled"] = False
+    config["community_auto_contribute"] = False
+    save_config(config)
+    return jsonify({"success": True, "enabled": False})
+
+
+@app.route('/api/community/jobs/<job_id>/backfill', methods=['POST'])
+def backfill_community_job(job_id: str):
+    """Queue durable contributions for already-finished streaming chapters.
+
+    This is intentionally a background-only operation: it only reads final
+    chapter files that have already been atomically published and never enters
+    the TTS/GPU queue.  Calling it repeatedly is safe because the local
+    contribution ledger de-duplicates each job/chapter pair.
+    """
+    config = load_config()
+    if not CommunityLibraryClient.enabled(config):
+        return jsonify({
+            "success": False,
+            "error": "请先在设置中启用公共书库并确认自动贡献。",
+        }), 409
+    with queue_lock:
+        job_entry = copy.deepcopy(jobs.get(job_id) or {})
+    if not job_entry:
+        return jsonify({"success": False, "error": "任务不存在。"}), 404
+    if not job_entry.get("streaming_mode"):
+        return jsonify({
+            "success": False,
+            "error": "只有流式有声书任务可以按章节回填公共书库。",
+        }), 409
+    job_dir = _job_dir_from_entry(job_id, job_entry)
+    chapters = streaming_store.list_chapters(job_id, include_segments=True)
+    ready = [
+        chapter for chapter in chapters
+        if chapter.get("state") == "ready"
+        and chapter.get("relative_path")
+        and (job_dir / str(chapter["relative_path"])).is_file()
+    ]
+    for chapter in ready:
+        community_library.contribute_async(
+            config=copy.deepcopy(config),
+            job_id=job_id,
+            job_entry=job_entry,
+            job_dir=job_dir,
+            chapter=chapter,
+            all_chapters=chapters,
+        )
+    return jsonify({
+        "success": True,
+        "queued": len(ready),
+        "message": "已在后台回填完成章节；本地生成不会暂停。",
+    })
 
 
 @app.route('/api/gemini/models', methods=['POST'])
@@ -7351,6 +10877,7 @@ def clear_all_jobs():
                     db_status = (row["status"] if row else None) or status
                     conn.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
                     conn.commit()
+                streaming_store.delete_job(job_id)
 
                 with queue_lock:
                     jobs.pop(job_id, None)
@@ -7446,6 +10973,7 @@ def delete_job(job_id: str):
                     job_dir = _job_dir_from_entry(job_id, {"job_dir": row["job_dir"]})
             conn.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
             conn.commit()
+        streaming_store.delete_job(job_id)
 
         with queue_lock:
             jobs.pop(job_id, None)
@@ -7500,6 +11028,7 @@ def pause_job(job_id: str):
 def resume_job(job_id: str):
     try:
         start_worker_thread()
+        recovered_chapters: List[int] = []
         with queue_lock:
             job_entry = jobs.get(job_id)
             if not job_entry:
@@ -7515,8 +11044,23 @@ def resume_job(job_id: str):
                 job_entry["interrupted_at"] = None
                 _persist_job_state(job_id, force=True)
                 return jsonify({"success": True, "message": "Job already completed"})
-            if job_entry.get("status") not in {"paused", "interrupted"}:
+            # A streaming task may fail only because one transient/model-level
+            # segment exhausted its retries. Keep its durable output and let a
+            # corrected fallback policy resume it from the first unfinished
+            # segment instead of forcing a whole-book restart.
+            if job_entry.get("status") not in {"paused", "interrupted", "failed"}:
                 return jsonify({"success": False, "error": "Job is not paused"}), 409
+            if (
+                job_entry.get("streaming_mode")
+                and int(job_entry.get("streaming_pipeline_version") or 1) >= 3
+            ):
+                cast_audit = streaming_store.get_cast_audit(job_id)
+                if cast_audit and not cast_audit.get("ready"):
+                    return jsonify({
+                        "success": False,
+                        "error": "人物与声线审计尚未通过，不能恢复生成",
+                        "cast_audit": cast_audit,
+                    }), 409
             pause_flags.pop(job_id, None)
             resume_from = job_entry.get("resume_from_chunk_index")
             if resume_from is None:
@@ -7525,6 +11069,15 @@ def resume_job(job_id: str):
             job_entry["status"] = "queued"
             job_entry["paused_at"] = None
             job_entry["interrupted_at"] = None
+            if job_entry.get("streaming_mode"):
+                # Failed segments are durable records, but on a deliberate
+                # resume they must become pending again. Otherwise the worker
+                # would skip that one line and fail again at chapter merge.
+                recovered_chapters = streaming_store.requeue_failed_segments(
+                    job_id
+                )
+                if recovered_chapters:
+                    job_entry["streaming_phase"] = "retrying"
         job_data = _build_job_data_from_entry(job_id, job_entry)
         job_queue.put(job_data)
         _persist_job_state(job_id, force=True)
@@ -7548,7 +11101,7 @@ def get_job_details(job_id: str):
                 "created_at": job_entry.get("created_at"),
                 "started_at": job_entry.get("started_at"),
                 "completed_at": job_entry.get("completed_at"),
-                "engine": job_entry.get("engine"),
+                "engine": _effective_job_engine(job_entry),
                 "speakers": job_entry.get("speakers") or _extract_speakers_for_text(text),
                 "text": text,
                 "voice_assignments": job_entry.get("voice_assignments") or {},
@@ -7673,6 +11226,8 @@ def update_library_title(job_id: str):
     metadata = load_job_metadata(job_dir) or {}
     metadata["collection_title"] = title
     save_job_metadata(job_dir, metadata)
+    _atomic_json_write(job_dir / LIBRARY_TITLE_FILENAME, {"title": title})
+    invalidate_library_cache()
 
     return jsonify({"success": True, "title": title})
 
@@ -7703,7 +11258,11 @@ def process_text_with_gemini():
                     "error": "Gemini API key not configured"
                 }), 400
 
-        prompt_prefix = prompt_override or (config.get('gemini_prompt') or '').strip()
+        prompt_prefix = (
+            prompt_override
+            or (config.get('llm_prompt') or '').strip()
+            or (config.get('gemini_prompt') or '').strip()
+        )
 
         sections = build_gemini_sections(text, prefer_chapters, config, section_headings)
         if not sections:
@@ -7727,6 +11286,16 @@ def process_text_with_gemini():
                 sorted(known_speakers)
             )
             response_text = _run_llm_prompt(combined_prompt, config)
+            recovered_text, fidelity_error, used_fallback = _recover_chinese_speaker_tags(
+                chapter_text,
+                response_text,
+            )
+            if recovered_text is None:
+                raise LocalLLMProcessorError(
+                    f"Section {idx} failed source-text validation: {fidelity_error}. "
+                    "No altered text was accepted; retry this section."
+                )
+            response_text = recovered_text
             detected_speakers = text_processor.extract_speakers(response_text)
             for speaker_name in detected_speakers:
                 known_speakers.add(speaker_name)
@@ -7735,7 +11304,8 @@ def process_text_with_gemini():
                 "title": section.get('title'),
                 "source": section.get('source'),
                 "output": response_text.strip(),
-                "speakers": detected_speakers
+                "speakers": detected_speakers,
+                "used_fallback": used_fallback,
             })
 
         if not processed_sections:
@@ -7795,7 +11365,11 @@ def process_full_text_with_gemini():
                     "error": "Gemini API key not configured"
                 }), 400
 
-        prompt_prefix = prompt_override or (config.get('gemini_prompt') or '').strip()
+        prompt_prefix = (
+            prompt_override
+            or (config.get('llm_prompt') or '').strip()
+            or (config.get('gemini_prompt') or '').strip()
+        )
 
         prompt_parts = []
         if prompt_prefix:
@@ -7859,6 +11433,18 @@ def process_gemini_speaker_profiles():
         prompt = compose_gemini_speaker_profile_prompt(prompt_prefix, speakers, context, processed_text)
         response_text = _run_llm_prompt(prompt, config)
         profiles = parse_gemini_speaker_table(response_text)
+        for profile in profiles.values():
+            profile_text = " ".join([
+                str(profile.get("name") or ""),
+                str(profile.get("description") or ""),
+                str(profile.get("voice") or ""),
+            ])
+            recommendations = recommend_voice_presets(profile_text, limit=3)
+            if recommendations:
+                profile["recommended_preset"] = recommendations[0]["id"]
+                profile["recommendation_confidence"] = recommendations[0]["confidence"]
+                profile["recommendation_reasons"] = recommendations[0]["reasons"]
+                profile["voice_recommendations"] = recommendations
 
         return jsonify({
             "success": True,
@@ -7943,7 +11529,11 @@ def process_gemini_section():
                     "error": "Gemini API key not configured"
                 }), 400
 
-        prompt_prefix = prompt_override or (config.get('gemini_prompt') or '').strip()
+        prompt_prefix = (
+            prompt_override
+            or (config.get('llm_prompt') or '').strip()
+            or (config.get('gemini_prompt') or '').strip()
+        )
 
         raw_known = data.get('known_speakers') or []
         known_speakers = []
@@ -7961,12 +11551,23 @@ def process_gemini_section():
             known_speakers
         )
         response_text = _run_llm_prompt(prompt, config)
+        recovered_text, fidelity_error, used_fallback = _recover_chinese_speaker_tags(
+            content,
+            response_text,
+        )
+        if recovered_text is None:
+            raise LocalLLMProcessorError(
+                f"Section failed source-text validation: {fidelity_error}. "
+                "No altered text was accepted; retry this section."
+            )
+        response_text = recovered_text
         detected_speakers = text_processor.extract_speakers(response_text)
 
         return jsonify({
             "success": True,
             "result_text": response_text.strip(),
-            "speakers": detected_speakers
+            "speakers": detected_speakers,
+            "used_fallback": used_fallback,
         })
 
     except (GeminiProcessorError, LocalLLMProcessorError, AtlasCloudProcessorError, OpenRouterProcessorError) as exc:
@@ -8059,14 +11660,67 @@ def generate_audio():
         text = (data.get('text') or '').strip()
         voice_assignments = data.get('voice_assignments', {})
         logger.info("Received voice_assignments: %s", voice_assignments)
-        split_by_chapter = bool(data.get('split_by_chapter', False))
-        generate_full_story = bool(data.get('generate_full_story', False)) and split_by_chapter
+        streaming_mode = bool(data.get("streaming_mode", False))
+        buffer_chapters = max(1, min(int(data.get("buffer_chapters") or 1), 5))
         section_headings = data.get('section_headings')
+        narrator_conversion = (
+            str(data.get("narrator_conversion") or "none").strip().lower()
+            if streaming_mode
+            else "none"
+        )
+        continue_full_book = bool(data.get("continue_full_book", False))
+        batch_strategy = str(
+            data.get("batch_strategy") or "adaptive_window"
+        ).strip().lower()
+        if batch_strategy not in {"adaptive_window", "serial"}:
+            return jsonify({
+                "success": False,
+                "error": "Unsupported batch strategy",
+            }), 400
+        batch_window_segments = max(
+            1,
+            min(int(data.get("batch_window_segments") or 12), 64),
+        )
+        max_batch_size = max(1, min(int(data.get("max_batch_size") or 4), 4))
+        cast_sampling = str(
+            data.get("cast_sampling") or "full_book"
+        ).strip().lower()
+        allow_multiple_protagonists = bool(
+            data.get("allow_multiple_protagonists", True)
+        )
+        source_text = strip_speaker_tags(text) if streaming_mode else text
+        character_profiles: List[Dict[str, Any]] = []
+        if streaming_mode:
+            source_sections = _streaming_section_layout(
+                source_text,
+                section_headings,
+            )
+            character_profiles = analyze_book_characters(
+                source_sections,
+                synopsis=extract_synopsis(source_text),
+                allow_multiple_protagonists=allow_multiple_protagonists,
+            )
+            tagged = tag_chinese_dialogue_detailed(
+                source_text,
+                character_profiles,
+                scene_key="book-import",
+            )
+            text = (
+                tagged.tagged_text
+                if tagged
+                else f"[narrator]{source_text}[/narrator]"
+            )
+        split_by_chapter = bool(data.get('split_by_chapter', False)) or streaming_mode
+        generate_full_story = bool(data.get('generate_full_story', False)) and split_by_chapter
         requested_format = (data.get('output_format') or '').strip().lower()
         requested_bitrate = data.get('output_bitrate_kbps')
-        requested_engine = (data.get('tts_engine') or '').strip().lower()
+        requested_engine = (
+            "qwen3_custom"
+            if streaming_mode
+            else (data.get('tts_engine') or '').strip().lower()
+        )
         engine_options = data.get('engine_options') if isinstance(data.get('engine_options'), dict) else None
-        review_mode = bool(data.get('review_mode', False))
+        review_mode = bool(data.get('review_mode', False)) and not streaming_mode
         raw_replacements = data.get('word_replacements')
         word_replacements = [
             r for r in (raw_replacements or [])
@@ -8124,6 +11778,30 @@ def generate_audio():
             config['acx_compliance'] = bool(requested_acx)
 
         voice_assignments = _prepare_voice_assignments(text, voice_assignments)
+        if streaming_mode:
+            for character in character_profiles:
+                character_id = str(character.get("character_id") or "")
+                voice = str(character.get("voice") or "")
+                if character_id and voice:
+                    voice_assignments[character_id] = {
+                        **(voice_assignments.get(character_id) or {}),
+                        "voice": voice,
+                        "extra": {
+                            "language": "Chinese",
+                            **(
+                                (voice_assignments.get(character_id) or {}).get("extra")
+                                or {}
+                            ),
+                        },
+                    }
+            voice_assignments = build_streaming_voice_assignments(
+                text,
+                voice_assignments,
+                speaker_genders={
+                    str(item.get("speaker") or ""): str(item.get("gender") or "neutral")
+                    for item in (tagged.attributions if tagged else [])
+                },
+            )
 
         _validate_voice_assignments_for_engine(
             active_engine,
@@ -8135,6 +11813,13 @@ def generate_audio():
         # Create job
         job_id = str(uuid.uuid4())
         text_path = _write_job_text(job_id, text)
+        source_text_path = (
+            _write_job_source_text(job_id, source_text)
+            if streaming_mode
+            else None
+        )
+        if streaming_mode:
+            streaming_store.ensure_characters(job_id, character_profiles)
         text_length = len(text)
         speakers = _extract_speakers_for_text(text)
         estimated_chunks = estimate_total_chunks(
@@ -8178,9 +11863,25 @@ def generate_audio():
                 "custom_heading": json.dumps({"enabled_headings": section_headings}) if section_headings else None,
                 "speakers": speakers,
                 "regen_tasks": {},
-                "engine": config.get("tts_engine"),
+                # Streaming jobs route through Qwen3 even when the user's
+                # regular-job default is another engine (for example IndexTTS).
+                "engine": active_engine,
                 "resume_from_chunk_index": 0,
                 "word_replacements": word_replacements,
+                "job_type": "streaming_audio" if streaming_mode else "audio",
+                "streaming_mode": streaming_mode,
+                "buffer_chapters": buffer_chapters,
+                "narrator_conversion": narrator_conversion,
+                "continue_full_book": continue_full_book,
+                "streaming_pipeline_version": 3 if streaming_mode else 1,
+                "source_text_path": source_text_path,
+                "batch_strategy": batch_strategy if streaming_mode else "serial",
+                "batch_window_segments": batch_window_segments,
+                "max_batch_size": max_batch_size if streaming_mode else 1,
+                "cast_sampling": cast_sampling if streaming_mode else "none",
+                "allow_multiple_protagonists": (
+                    allow_multiple_protagonists if streaming_mode else False
+                ),
             }
             jobs[job_id]["job_payload"] = _build_job_payload(job_id, text, jobs[job_id])
         
@@ -8199,6 +11900,21 @@ def generate_audio():
             "section_headings": section_headings,
             "resume_from_chunk_index": 0,
             "word_replacements": word_replacements,
+            "job_type": "streaming_audio" if streaming_mode else "audio",
+            "streaming_mode": streaming_mode,
+            "buffer_chapters": buffer_chapters,
+            "narrator_conversion": narrator_conversion,
+            "continue_full_book": continue_full_book,
+            "streaming_pipeline_version": 3 if streaming_mode else 1,
+            "source_text_path": source_text_path,
+            "source_text": source_text if streaming_mode else "",
+            "batch_strategy": batch_strategy if streaming_mode else "serial",
+            "batch_window_segments": batch_window_segments,
+            "max_batch_size": max_batch_size if streaming_mode else 1,
+            "cast_sampling": cast_sampling if streaming_mode else "none",
+            "allow_multiple_protagonists": (
+                allow_multiple_protagonists if streaming_mode else False
+            ),
         }
 
         _persist_job_state(job_id, force=True)
@@ -8233,6 +11949,12 @@ def generate_audio():
             "job_id": job_id,
             "status": "queued",
             "queue_position": job_queue.qsize()
+            ,
+            "streaming_mode": streaming_mode,
+            "engine": active_engine,
+            "chapters_url": f"/api/jobs/{job_id}/chapters" if streaming_mode else None,
+            "events_url": f"/api/jobs/{job_id}/events" if streaming_mode else None,
+            "characters_url": f"/api/jobs/{job_id}/characters" if streaming_mode else None,
         })
         
     except ValueError as e:
@@ -8545,6 +12267,7 @@ def _build_library_listing():
 
         job_id = job_dir.name
         metadata = load_job_metadata(job_dir)
+        library_title = load_library_title(job_dir, metadata)
 
         if metadata and (metadata.get("chapters") or metadata.get("books") or metadata.get("full_story")):
             chapters_data = []
@@ -8664,14 +12387,19 @@ def _build_library_listing():
                 _word_replacements = (jobs.get(job_id) or {}).get("word_replacements") or metadata.get("word_replacements") or []
                 library_items.append({
                     "job_id": job_id,
+                    "title": library_title,
                     "output_file": chapters_data[0]["output_file"],
                     "relative_path": chapters_data[0]["relative_path"],
                     "created_at": (created_ts or datetime.now()).isoformat(),
                     "file_size": total_size,
                     "format": metadata.get("output_format", chapters_data[0]["format"]),
+                    "chapter_count": metadata.get("chapter_count") or len(chapters_data),
+                    "ready_chapter_count": len(chapters_data),
+                    "streaming_mode": bool(metadata.get("streaming_mode")),
+                    "status": (jobs.get(job_id) or {}).get("status"),
                     "chapter_mode": metadata.get("chapter_mode", False),
                     "book_mode": metadata.get("book_mode", False),
-                    "collection_title": metadata.get("collection_title"),
+                    "collection_title": library_title,
                     "books": chapters_data if metadata.get("book_mode") else [],
                     "chapters": chapters_data,
                     "full_story": full_story_entry,
@@ -8690,14 +12418,19 @@ def _build_library_listing():
                 _word_replacements2 = (jobs.get(job_id) or {}).get("word_replacements") or metadata.get("word_replacements") or []
                 library_items.append({
                     "job_id": job_id,
+                    "title": library_title,
                     "output_file": full_story_entry["output_file"],
                     "relative_path": full_story_entry["relative_path"],
                     "created_at": (created_ts or datetime.now()).isoformat(),
                     "file_size": total_size or full_story_entry.get("file_size"),
                     "format": metadata.get("output_format", full_story_entry.get("format")),
+                    "chapter_count": metadata.get("chapter_count") or 1,
+                    "ready_chapter_count": 1,
+                    "streaming_mode": bool(metadata.get("streaming_mode")),
+                    "status": (jobs.get(job_id) or {}).get("status"),
                     "chapter_mode": metadata.get("chapter_mode", False),
                     "book_mode": metadata.get("book_mode", False),
-                    "collection_title": metadata.get("collection_title"),
+                    "collection_title": library_title,
                     "books": [],
                     "chapters": [],
                     "full_story": full_story_entry,
@@ -8761,6 +12494,7 @@ def _build_library_listing():
                         pass
                 library_items.append({
                     "job_id": job_id,
+                    "title": library_title,
                     "output_file": chapters_data[0]["output_file"],
                     "relative_path": chapters_data[0]["relative_path"],
                     "created_at": (created_ts or datetime.now()).isoformat(),
@@ -8793,6 +12527,7 @@ def _build_library_listing():
                     pass
             library_items.append({
                 "job_id": job_id,
+                "title": library_title,
                 "output_file": f"/static/audio/{job_id}/{output_file.name}",
                 "relative_path": output_file.name,
                 "created_at": created_time.isoformat(),
@@ -9334,7 +13069,10 @@ def _rebuild_review_manifest_from_chunks(job_id: str, job_dir: Path, force_rebui
                     "relative_file": rel_file,
                 }
                 # Carry over text/speaker/voice data from original if present
-                for field in ("speaker", "text", "engine", "emotion", "voice_assignment", "voice_label",
+                for field in ("speaker", "text", "engine", "emotion", "emotion_label",
+                              "emotion_source", "emotion_confidence", "emotion_reason",
+                              "emotion_driver",
+                              "voice_assignment", "voice_label",
                               "duration_seconds", "regenerated_at", "regen_status", "file_path"):
                     if field in orig:
                         record[field] = orig[field]
@@ -10216,6 +13954,19 @@ def get_queue():
                         "post_process_done": job_info.get("post_process_done", 0),
                         "post_process_active": job_info.get("post_process_active", False),
                         "post_process_percent": job_info.get("post_process_percent", 0),
+                        "streaming_mode": job_info.get("streaming_mode", False),
+                        "streaming_phase": job_info.get("streaming_phase"),
+                        "streaming_warning": job_info.get("streaming_warning"),
+                        "streaming_pipeline_version": job_info.get("streaming_pipeline_version"),
+                        "cast_audit": job_info.get("cast_audit"),
+                        "recast": job_info.get("recast"),
+                        "streaming_summary": (
+                            streaming_store.summary(job_id)
+                            if job_info.get("streaming_mode")
+                            else None
+                        ),
+                        "active_chapter_index": job_info.get("active_chapter_index"),
+                        "active_chapter_title": job_info.get("active_chapter_title"),
                     })
                 
                 all_jobs.sort(key=lambda x: x['created_at'], reverse=True)
@@ -10313,6 +14064,9 @@ def health_check():
             CHATTERBOX_TURBO_UNAVAILABLE_REASON if not CHATTERBOX_TURBO_AVAILABLE else ""
         ),
         "qwen3_available": QWEN3_AVAILABLE,
+        "qwen3_mlx_available": QWEN3_MLX_AVAILABLE,
+        "qwen3_clone_available": QWEN3_CLONE_AVAILABLE,
+        "qwen3_voice_design_available": QWEN3_AVAILABLE,
         "omnivoice_available": OMNIVOICE_AVAILABLE,
         "pocket_tts_available": POCKET_TTS_AVAILABLE,
         "kitten_tts_available": KITTEN_TTS_AVAILABLE,
@@ -10346,19 +14100,70 @@ def qwen3_metadata():
     if not QWEN3_AVAILABLE:
         return jsonify({
             "success": False,
-            "error": "qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode."
+            "error": "Qwen3-TTS is unavailable. Install mlx-audio on Apple Silicon or qwen-tts on CUDA."
         }), 400
-    # Return static metadata - these are the actual Qwen3-TTS-CustomVoice supported speakers/languages
-    # Avoids loading the full model (~3-4GB GPU) just to get this list
+    config = load_config()
+    model_id = (config.get("qwen3_custom_model_id") or DEFAULT_QWEN3_CUSTOM_MODEL).strip()
+    uses_voice_design = "voicedesign" in model_id.replace("-", "").lower()
+    if uses_voice_design:
+        presets = list_voice_presets()
+        speakers = [preset["id"] for preset in presets]
+        speaker_labels = {
+            preset["id"]: preset["label"]
+            for preset in presets
+        }
+    else:
+        speakers = [
+            "aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"
+        ]
+        speaker_labels = {}
+    # Static metadata avoids loading the full model merely to populate controls.
     return jsonify({
         "success": True,
-        "speakers": [
-            "aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"
-        ],
+        "mode": "voice_design" if uses_voice_design else "custom_voice",
+        "speakers": speakers,
+        "speaker_labels": speaker_labels,
+        "presets": presets if uses_voice_design else [],
         "languages": [
             "auto", "english", "chinese", "japanese", "korean", "french", "german",
             "spanish", "italian", "portuguese", "russian"
         ],
+    })
+
+
+@app.route('/api/qwen3/voice-design/presets', methods=['GET'])
+def qwen3_voice_design_presets():
+    """Return Chinese-first, original character casting presets."""
+    return jsonify({
+        "success": True,
+        "default_text": CHINESE_SAMPLE_TEXT,
+        "presets": list_voice_presets(),
+        "acting_states": list_acting_states(),
+    })
+
+
+@app.route('/api/qwen3/voice-design/recommend', methods=['POST'])
+def qwen3_voice_design_recommend():
+    """Recommend original Mandarin archetypes for a novel character profile."""
+    payload = request.get_json(silent=True) or {}
+    profile = (payload.get("profile") or "").strip()
+    gender = (payload.get("gender") or "").strip() or None
+    try:
+        limit = int(payload.get("limit") or 3)
+    except (TypeError, ValueError):
+        limit = 3
+    if not profile:
+        return jsonify({
+            "success": False,
+            "error": "Character profile is required.",
+        }), 400
+    return jsonify({
+        "success": True,
+        "recommendations": recommend_voice_presets(
+            profile,
+            gender=gender,
+            limit=limit,
+        ),
     })
 
 
@@ -10367,7 +14172,10 @@ def qwen3_voice_design_preview():
     if not QWEN3_AVAILABLE:
         return jsonify({
             "success": False,
-            "error": "qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode."
+            "error": (
+                "Qwen3-TTS VoiceDesign is unavailable. Install mlx-audio on "
+                "Apple Silicon or qwen-tts on a CUDA machine."
+            )
         }), 400
     payload = request.get_json(silent=True) or {}
     text = (payload.get("text") or "").strip()
@@ -10378,12 +14186,55 @@ def qwen3_voice_design_preview():
     return jsonify({"success": True, "job_id": job_id}), 202
 
 
+@app.route('/api/qwen3/voice-design/audition', methods=['POST'])
+def qwen3_voice_design_audition():
+    """Render one short preset audition without joining the book job queue.
+
+    This is deliberately synchronous: a person comparing voices should not
+    wait behind a long-running audiobook job. ``gpu_inference_lock`` inside
+    the shared renderer still keeps model access safe with production work.
+    """
+    if not QWEN3_AVAILABLE:
+        return jsonify({
+            "success": False,
+            "error": (
+                "Qwen3-TTS VoiceDesign is unavailable. Install mlx-audio on "
+                "Apple Silicon or qwen-tts on a CUDA machine."
+            )
+        }), 400
+
+    payload = request.get_json(silent=True) or {}
+    text = (payload.get("text") or "").strip()
+    preset_id = (payload.get("preset_id") or "").strip()
+    if not text:
+        return jsonify({"success": False, "error": "Text is required to audition a voice."}), 400
+    if len(text) > 300:
+        return jsonify({"success": False, "error": "Audition text must be 300 characters or fewer."}), 400
+    if not preset_id or not get_voice_preset(preset_id):
+        return jsonify({"success": False, "error": "Choose a valid voice preset before auditioning."}), 400
+
+    try:
+        result = _generate_voice_design_preview({
+            "text": text,
+            "preset_id": preset_id,
+            "acting_state": (payload.get("acting_state") or "").strip(),
+            "language": "Chinese",
+        }, load_config())
+        return jsonify({"success": True, **result})
+    except Exception as exc:
+        logger.error("Voice audition failed for preset %s: %s", preset_id, exc, exc_info=True)
+        return jsonify({"success": False, "error": str(exc) or "Unable to audition this voice."}), 400
+
+
 @app.route('/api/qwen3/voice-design/save', methods=['POST'])
 def qwen3_voice_design_save():
     if not QWEN3_AVAILABLE:
         return jsonify({
             "success": False,
-            "error": "qwen-tts is not installed. Run setup to enable Qwen3-TTS local mode."
+            "error": (
+                "Qwen3-TTS VoiceDesign is unavailable. Install mlx-audio on "
+                "Apple Silicon or qwen-tts on a CUDA machine."
+            )
         }), 400
     payload = request.get_json(silent=True) or {}
     name = (payload.get("name") or "").strip()
@@ -10575,10 +14426,15 @@ if __name__ == '__main__':
     _init_jobs_db()
     _purge_stale_jobs()
     _restore_jobs_from_db()
+    _auto_resume_streaming_jobs_after_restart()
     _archive_old_jobs()
     _cleanup_orphaned_chatterbox_voices()
     _auto_register_voice_prompt_files()
     _cleanup_orphaned_regen_folders()
+    server_port = int(os.environ.get("TTS_STORY_PORT", "5000"))
     if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-        threading.Timer(1.5, lambda: webbrowser.open("http://localhost:5000")).start()
-    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+        threading.Timer(
+            1.5,
+            lambda: webbrowser.open(f"http://localhost:{server_port}"),
+        ).start()
+    app.run(host='0.0.0.0', port=server_port, debug=True, use_reloader=False)

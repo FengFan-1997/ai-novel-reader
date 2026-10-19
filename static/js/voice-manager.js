@@ -17,6 +17,9 @@ let samplesReady = false;
 let lastFailedSamples = [];
 let customVoices = [];
 let qwenVoicePreview = null;
+let qwenVoicePresets = [];
+let qwenActingStates = [];
+let qwenDefaultSampleText = '';
 
 const generateSamplesBtnId = 'generate-voice-samples-btn';
 const regenerateSamplesBtnId = 'regenerate-voice-samples-btn';
@@ -201,13 +204,18 @@ async function exportVoicesBatch(voiceIds) {
 function setupQwenVoiceCreation() {
     const generateBtn = document.getElementById('qwen-voice-generate-btn');
     const saveBtn = document.getElementById('qwen-voice-save-btn');
+    const presetSelect = document.getElementById('qwen-voice-preset');
     if (generateBtn) {
         generateBtn.addEventListener('click', generateQwenVoicePreview);
     }
     if (saveBtn) {
         saveBtn.addEventListener('click', saveQwenVoicePrompt);
     }
+    if (presetSelect) {
+        presetSelect.addEventListener('change', applyQwenVoicePreset);
+    }
     loadQwenVoiceLanguages();
+    loadQwenVoicePresets();
 }
 
 async function loadQwenVoiceLanguages() {
@@ -227,11 +235,101 @@ async function loadQwenVoiceLanguages() {
             option.textContent = language;
             select.appendChild(option);
         });
-        if (previous) {
-            select.value = previous;
-        }
+        const preferred = previous || 'chinese';
+        select.value = Array.from(select.options).some(option => option.value === preferred)
+            ? preferred
+            : 'Auto';
     } catch (error) {
         console.warn('Unable to load Qwen3 metadata', error);
+    }
+}
+
+async function loadQwenVoicePresets() {
+    const presetSelect = document.getElementById('qwen-voice-preset');
+    const stateSelect = document.getElementById('qwen-voice-acting-state');
+    if (!presetSelect || !stateSelect) return;
+    try {
+        const response = await fetch('/api/qwen3/voice-design/presets');
+        const data = await response.json();
+        if (!data.success) {
+            throw new Error(data.error || 'Failed to load Chinese voice presets');
+        }
+        qwenVoicePresets = Array.isArray(data.presets) ? data.presets : [];
+        qwenActingStates = Array.isArray(data.acting_states) ? data.acting_states : [];
+        qwenDefaultSampleText = data.default_text || '';
+
+        presetSelect.innerHTML = '<option value="">— 自定义声线 —</option>';
+        const groupedPresets = new Map();
+        qwenVoicePresets.forEach(preset => {
+            const source = preset.source || '其他';
+            if (!groupedPresets.has(source)) groupedPresets.set(source, []);
+            groupedPresets.get(source).push(preset);
+        });
+        groupedPresets.forEach((presets, source) => {
+            const group = document.createElement('optgroup');
+            group.label = source;
+            presets.forEach(preset => {
+                const option = document.createElement('option');
+                option.value = preset.id;
+                option.textContent = preset.label || preset.name || preset.id;
+                const references = Array.isArray(preset.reference_characters)
+                    ? preset.reference_characters.join('、')
+                    : '';
+                option.title = references
+                    ? `${preset.description || ''}｜人设参考：${references}`
+                    : (preset.description || '');
+                group.appendChild(option);
+            });
+            presetSelect.appendChild(group);
+        });
+
+        stateSelect.innerHTML = '';
+        qwenActingStates.forEach(state => {
+            const option = document.createElement('option');
+            option.value = state.id;
+            option.textContent = state.label || state.id;
+            stateSelect.appendChild(option);
+        });
+
+        const textInput = document.getElementById('qwen-voice-text');
+        if (textInput && !textInput.value.trim() && qwenDefaultSampleText) {
+            textInput.value = qwenDefaultSampleText;
+        }
+    } catch (error) {
+        console.warn('Unable to load Chinese voice presets', error);
+    }
+}
+
+function applyQwenVoicePreset() {
+    const presetSelect = document.getElementById('qwen-voice-preset');
+    const preset = qwenVoicePresets.find(item => item.id === presetSelect?.value);
+    if (!preset) return;
+
+    const nameInput = document.getElementById('qwen-voice-name');
+    const genderSelect = document.getElementById('qwen-voice-gender');
+    const languageSelect = document.getElementById('qwen-voice-language');
+    const descriptionInput = document.getElementById('qwen-voice-description');
+    const textInput = document.getElementById('qwen-voice-text');
+    const stateSelect = document.getElementById('qwen-voice-acting-state');
+    const help = document.getElementById('qwen-voice-preset-help');
+
+    if (nameInput) nameInput.value = preset.name || '';
+    if (genderSelect) genderSelect.value = preset.gender || '';
+    if (languageSelect) languageSelect.value = 'chinese';
+    if (descriptionInput) descriptionInput.value = preset.description || '';
+    if (textInput && !textInput.value.trim()) {
+        textInput.value = qwenDefaultSampleText;
+    }
+    if (stateSelect) stateSelect.value = preset.default_state || 'neutral';
+    if (help) {
+        const references = Array.isArray(preset.reference_characters)
+            ? preset.reference_characters.join('、')
+            : '';
+        help.textContent = [
+            preset.description || preset.label,
+            references ? `人设参考：${references}（原创声线，非官方原声或声音克隆）` : '',
+            '可在“Voice Style Instruction”里追加细节'
+        ].filter(Boolean).join('。') + '。';
     }
 }
 
@@ -239,6 +337,8 @@ async function generateQwenVoicePreview() {
     const textInput = document.getElementById('qwen-voice-text');
     const instructInput = document.getElementById('qwen-voice-instruct');
     const languageSelect = document.getElementById('qwen-voice-language');
+    const presetSelect = document.getElementById('qwen-voice-preset');
+    const stateSelect = document.getElementById('qwen-voice-acting-state');
     const previewAudio = document.getElementById('qwen-voice-preview');
     const status = document.getElementById('qwen-voice-status');
     const saveBtn = document.getElementById('qwen-voice-save-btn');
@@ -246,6 +346,8 @@ async function generateQwenVoicePreview() {
     const text = textInput?.value.trim() || '';
     const instruct = instructInput?.value.trim() || '';
     const language = languageSelect?.value || 'Auto';
+    const presetId = presetSelect?.value || '';
+    const actingState = stateSelect?.value || 'neutral';
 
     if (!text) {
         showToast('Enter sample text for the preview.', 'warning');
@@ -267,7 +369,13 @@ async function generateQwenVoicePreview() {
         const response = await fetch('/api/qwen3/voice-design/preview', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, instruct, language }),
+            body: JSON.stringify({
+                text,
+                instruct,
+                language,
+                preset_id: presetId,
+                acting_state: actingState,
+            }),
         });
         const data = await response.json();
         if (!data.success) {
@@ -308,6 +416,8 @@ async function saveQwenVoicePrompt() {
     const descriptionInput = document.getElementById('qwen-voice-description');
     const textInput = document.getElementById('qwen-voice-text');
     const instructInput = document.getElementById('qwen-voice-instruct');
+    const presetSelect = document.getElementById('qwen-voice-preset');
+    const stateSelect = document.getElementById('qwen-voice-acting-state');
     const status = document.getElementById('qwen-voice-status');
     const saveBtn = document.getElementById('qwen-voice-save-btn');
 
@@ -317,6 +427,8 @@ async function saveQwenVoicePrompt() {
     const description = descriptionInput?.value.trim() || '';
     const text = textInput?.value.trim() || '';
     const instruct = instructInput?.value.trim() || '';
+    const presetId = presetSelect?.value || '';
+    const actingState = stateSelect?.value || 'neutral';
 
     if (!name) {
         showToast('Add a name before saving the voice prompt.', 'warning');
@@ -349,6 +461,8 @@ async function saveQwenVoicePrompt() {
                 description,
                 text,
                 instruct,
+                preset_id: presetId,
+                acting_state: actingState,
                 audio_base64: qwenVoicePreview.audio_base64,
             }),
         });
