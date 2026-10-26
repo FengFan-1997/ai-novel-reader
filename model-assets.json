@@ -1,5 +1,7 @@
 {
   "schema_version": 1,
+  "audited_at": "2026-10-26",
+  "scope": "This catalog records model and runtime asset sources used by this project. Optional engine entries are not necessarily installed or downloaded.",
   "bootstrap": {
     "ollama": {
       "config_key": "llm_local_model",
@@ -14,12 +16,41 @@
       "provider": "Hugging Face Hub",
       "config_keys": [
         "qwen3_custom_model_id",
+        "qwen3_custom_clone_model_id",
         "qwen3_clone_model_id",
         "qwen3_voice_design_model_id"
       ],
       "source_template": "https://huggingface.co/{model_id}",
+      "models": [
+        {
+          "model_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
+          "role": "current Mac voice-design model",
+          "source_url": "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
+          "measured_local_size": "about 2.9 GiB"
+        },
+        {
+          "model_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+          "role": "current Mac reference-clone / stable voice-lock model",
+          "source_url": "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+          "measured_local_size": "about 2.9 GiB"
+        },
+        {
+          "model_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+          "role": "cached optional model; not selected in current config",
+          "source_url": "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+          "measured_local_size": "about 2.9 GiB"
+        },
+        {
+          "model_id": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+          "role": "cached smaller optional/fallback model; not selected in current config",
+          "source_url": "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+          "measured_local_size": "about 1.9 GiB"
+        }
+      ],
+      "official_model_family": "https://huggingface.co/Qwen",
+      "official_source_code": "https://github.com/QwenLM/Qwen3-TTS",
       "download": "huggingface_hub.snapshot_download when the engine is first loaded",
-      "local_path": "models/qwen3/",
+      "local_path": "Apple Silicon MLX: ~/.cache/huggingface/hub/models--<owner>--<model>; PyTorch backend: models/qwen3/<owner>_<model>/",
       "integrity": "Model repository revisions are resolved by Hugging Face Hub; this project does not pin a commit SHA-256."
     },
     {
@@ -28,6 +59,7 @@
       "config_key": "llm_local_model",
       "default_model": "qwen3:1.7b",
       "source_url": "https://ollama.com/library/qwen3",
+      "measured_local_status": "ollama list was empty during audit; no Ollama model weights were present",
       "download": "ollama pull <model>; invoked by the macOS setup script",
       "integrity": "Downloaded and verified by Ollama; this project does not pin a manifest digest."
     },
@@ -37,9 +69,53 @@
       "repository": "IndexTeam/IndexTTS-2",
       "config_key": "index_tts_model_version",
       "source_url": "https://huggingface.co/IndexTeam/IndexTTS-2",
+      "modelscope_source_url": "https://modelscope.cn/models/IndexTeam/IndexTTS-2",
       "download": "IndexTTS worker snapshot_download on first use (worker reports approximately 5.5 GB)",
       "local_path": "engines/index-tts/checkpoints/",
+      "measured_local_size": "about 8.3 GiB including auxiliary checkpoints",
       "integrity": "Hub metadata is used; this project does not pin a commit SHA-256."
+    },
+    {
+      "id": "index_tts2_auxiliary_models",
+      "provider": "Hugging Face Hub, with ModelScope mappings implemented by the IndexTTS downloader",
+      "download": "Downloaded automatically by engines/index-tts/indextts/utils/model_download.py when IndexTTS first starts",
+      "local_path": "engines/index-tts/checkpoints/hf_cache/",
+      "models": [
+        {
+          "model_id": "facebook/w2v-bert-2.0",
+          "source_url": "https://huggingface.co/facebook/w2v-bert-2.0",
+          "modelscope_id": "AI-ModelScope/w2v-bert-2.0",
+          "modelscope_source_url": "https://modelscope.cn/models/AI-ModelScope/w2v-bert-2.0",
+          "measured_local_size": "about 2.2 GiB"
+        },
+        {
+          "model_id": "amphion/MaskGCT",
+          "source_url": "https://huggingface.co/amphion/MaskGCT",
+          "file": "semantic_codec/model.safetensors",
+          "measured_local_size": "about 169 MiB"
+        },
+        {
+          "model_id": "funasr/campplus",
+          "source_url": "https://huggingface.co/funasr/campplus",
+          "modelscope_id": "iic/speech_campplus_sv_zh-cn_16k-common",
+          "modelscope_source_url": "https://modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common",
+          "file": "campplus_cn_common.bin",
+          "measured_local_size": "about 27 MiB"
+        },
+        {
+          "model_id": "nvidia/bigvgan_v2_22khz_80band_256x",
+          "source_url": "https://huggingface.co/nvidia/bigvgan_v2_22khz_80band_256x",
+          "measured_local_size": "about 428 MiB"
+        },
+        {
+          "model_id": "IndexTeam/IndexTTS-2",
+          "source_url": "https://huggingface.co/IndexTeam/IndexTTS-2",
+          "file": "qwen0.6bemo4-merge/model.safetensors",
+          "measured_local_size": "about 1.1 GiB",
+          "note": "Part of the main IndexTTS-2 repository, not a separate Ollama model."
+        }
+      ],
+      "integrity": "Downloads use upstream Hub metadata; no project-level SHA-256 lock is maintained."
     },
     {
       "id": "yae_miko_rvc_community_model",
@@ -61,6 +137,146 @@
       ],
       "local_path": "data/rvc/yae_miko/",
       "integrity": "No upstream SHA-256 is pinned; setup checks non-empty files and a minimum size only. Community voice/data rights require separate review."
+    },
+    {
+      "id": "rvc_helper_models",
+      "provider": "rvc-python package download helper",
+      "package": "rvc-python==0.1.5",
+      "package_source_url": "https://pypi.org/project/rvc-python/",
+      "download_source_code": "https://github.com/daswer123/rvc-python",
+      "download": "Automatically downloaded into the installed rvc_python package directory when RVC initializes",
+      "models": [
+        {
+          "name": "hubert_base.pt",
+          "url": "https://huggingface.co/Daswer123/RVC_Base/resolve/main/hubert_base.pt"
+        },
+        {
+          "name": "rmvpe.pt",
+          "url": "https://huggingface.co/Daswer123/RVC_Base/resolve/main/rmvpe.pt"
+        },
+        {
+          "name": "rmvpe.onnx",
+          "url": "https://huggingface.co/Daswer123/RVC_Base/resolve/main/rmvpe.onnx"
+        }
+      ],
+      "local_path": "data/rvc/venv/lib/python3.10/site-packages/rvc_python/base_model/",
+      "measured_local_size": "about 698 MiB; installed torchcrepe assets add about 87 MiB and are only needed by the optional CREPE pitch method",
+      "integrity": "The installed rvc-python downloader does not pin SHA-256 hashes."
+    },
+    {
+      "id": "sensevoice_asr",
+      "provider": "ModelScope / FunASR",
+      "model_id": "iic/SenseVoiceSmall",
+      "source_url": "https://modelscope.cn/models/iic/SenseVoiceSmall",
+      "download": "FunASR AutoModel downloads it only when optional reference-audio transcription is requested by Qwen3 clone, VoxCPM, or Dot.TTS",
+      "local_path": "FunASR/ModelScope cache; exact path is managed by the installed package",
+      "measured_local_status": "not found in project-local model folders or the Hugging Face Hub cache during audit"
+    },
+    {
+      "id": "whisper_tiny_mlx_orphan_cache",
+      "provider": "Hugging Face Hub community repository",
+      "model_id": "mlx-community/whisper-tiny-mlx",
+      "source_url": "https://huggingface.co/mlx-community/whisper-tiny-mlx",
+      "download": "No current project source reference found during audit; this was an existing local cache only",
+      "local_path": "~/.cache/huggingface/hub/models--mlx-community--whisper-tiny-mlx/",
+      "measured_local_size": "about 71 MiB",
+      "integrity": "Not pinned by this project."
+    },
+    {
+      "id": "chatterbox_turbo_optional",
+      "provider": "Hugging Face Hub",
+      "model_id": "ResembleAI/chatterbox-turbo",
+      "source_url": "https://huggingface.co/ResembleAI/chatterbox-turbo",
+      "download": "First use of the optional local Chatterbox Turbo engine",
+      "installed_on_audit_machine": false
+    },
+    {
+      "id": "omnivoice_optional",
+      "provider": "Hugging Face Hub",
+      "model_id": "k2-fsa/OmniVoice",
+      "source_url": "https://huggingface.co/k2-fsa/OmniVoice",
+      "download": "First use/prefetch of optional OmniVoice clone or design engine",
+      "installed_on_audit_machine": false
+    },
+    {
+      "id": "voxcpm_optional",
+      "provider": "Hugging Face Hub",
+      "model_id": "openbmb/VoxCPM1.5",
+      "source_url": "https://huggingface.co/openbmb/VoxCPM1.5",
+      "download": "First use of the optional local VoxCPM engine",
+      "installed_on_audit_machine": false
+    },
+    {
+      "id": "dots_tts_optional",
+      "provider": "Hugging Face Hub",
+      "model_id": "rednote-hilab/dots.tts-soar",
+      "canonical_source_url": "https://huggingface.co/dots-studio/dots.tts-soar",
+      "source_url": "https://huggingface.co/rednote-hilab/dots.tts-soar",
+      "download": "First use of the optional local Dot.TTS engine; the configured repository URL currently redirects to dots-studio",
+      "installed_on_audit_machine": false
+    },
+    {
+      "id": "kitten_tts_optional",
+      "provider": "Hugging Face Hub",
+      "model_id": "KittenML/kitten-tts-micro-0.8",
+      "source_url": "https://huggingface.co/KittenML/kitten-tts-micro-0.8",
+      "engine_default_model_id": "KittenML/kitten-tts-mini-0.8",
+      "engine_default_source_url": "https://huggingface.co/KittenML/kitten-tts-mini-0.8",
+      "setup_prefetch_model_id": "KittenML/kitten-tts-mini-0.8",
+      "package_url": "https://github.com/KittenML/KittenTTS/releases/download/0.8/kittentts-0.8.0-py3-none-any.whl",
+      "download": "Optional KittenTTS engine. Current config.json selects micro-0.8; engine default and Windows setup prefetch select mini-0.8.",
+      "note": "The configured model and setup prefetch are inconsistent; choose/align them before relying on a prewarmed cache.",
+      "installed_on_audit_machine": false
+    },
+    {
+      "id": "pocket_tts_optional",
+      "provider": "Hugging Face Hub",
+      "model_id": "kyutai/pocket-tts",
+      "source_url": "https://huggingface.co/kyutai/pocket-tts",
+      "voices_source_url": "https://huggingface.co/kyutai/tts-voices",
+      "download": "Optional Pocket TTS engine; access requires accepting the model repository terms",
+      "installed_on_audit_machine": false
+    },
+    {
+      "id": "kokoro_optional",
+      "provider": "Hugging Face Hub",
+      "model_id": "hexgrad/Kokoro-82M",
+      "source_url": "https://huggingface.co/hexgrad/Kokoro-82M",
+      "source_code": "https://github.com/hexgrad/kokoro",
+      "download": "Optional Kokoro engine; model files are fetched by the Kokoro runtime",
+      "installed_on_audit_machine": false
+    }
+  ],
+  "online_services_without_local_model_weights": [
+    {
+      "id": "gemini_api",
+      "source_url": "https://ai.google.dev/gemini-api/docs/models",
+      "note": "Gemini model IDs in config are remote API identifiers, not downloaded files."
+    },
+    {
+      "id": "azure_speech",
+      "source_url": "https://learn.microsoft.com/azure/ai-services/speech-service/text-to-speech",
+      "note": "Voices are served by the configured Azure region; no TTS weights are stored locally."
+    },
+    {
+      "id": "elevenlabs",
+      "source_url": "https://elevenlabs.io/docs/models",
+      "note": "Voice/model catalogs and synthesis are hosted by ElevenLabs."
+    },
+    {
+      "id": "replicate",
+      "source_url": "https://replicate.com/",
+      "note": "Hosted engine adapters send requests to Replicate; model weights are not stored in this project."
+    },
+    {
+      "id": "edge_tts",
+      "source_url": "https://github.com/rany2/edge-tts",
+      "note": "Uses an online voice service and does not download a local TTS model."
+    },
+    {
+      "id": "openrouter",
+      "source_url": "https://openrouter.ai/models",
+      "note": "Remote language-model catalog; no local weights."
     }
   ]
 }

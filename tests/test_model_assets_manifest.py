@@ -18,6 +18,26 @@ def test_model_manifest_covers_setup_and_runtime_assets():
     assert "qwen3_custom_model_id" in assets["qwen3_tts"]["config_keys"]
     assert assets["index_tts2"]["repository"] == "IndexTeam/IndexTTS-2"
     assert all(item["sha256"] is None for item in assets["yae_miko_rvc_community_model"]["files"])
+    qwen_models = {item["model_id"]: item for item in assets["qwen3_tts"]["models"]}
+    assert "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit" in qwen_models
+    assert "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit" in qwen_models
+    index_aux = {item["model_id"] for item in assets["index_tts2_auxiliary_models"]["models"]}
+    assert {"facebook/w2v-bert-2.0", "amphion/MaskGCT", "nvidia/bigvgan_v2_22khz_80band_256x"} <= index_aux
+    assert len(assets["rvc_helper_models"]["models"]) == 3
+    assert assets["rvc_helper_models"]["download_source_code"] == "https://github.com/daswer123/rvc-python"
+    assert "models--<owner>--<model>" in assets["qwen3_tts"]["local_path"]
+    assert "kitten-tts-micro-0.8" in assets["kitten_tts_optional"]["model_id"]
+    assert "kitten-tts-mini-0.8" in assets["kitten_tts_optional"]["setup_prefetch_model_id"]
+    assert {
+        "chatterbox_turbo_optional",
+        "omnivoice_optional",
+        "voxcpm_optional",
+        "dots_tts_optional",
+        "kitten_tts_optional",
+        "pocket_tts_optional",
+        "kokoro_optional",
+    } <= set(assets)
+    assert manifest["online_services_without_local_model_weights"]
 
 
 def test_install_scripts_read_third_party_sources_from_manifest():
