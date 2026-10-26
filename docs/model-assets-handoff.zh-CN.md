@@ -6,21 +6,21 @@
 
 ## 结论
 
-当前工作配置使用 **Qwen3-TTS 1.7B** 生成语音、**Ollama Qwen3 1.7B** 做本地文本分析；旁白的八重神子 RVC 转换也有本地权重。IndexTTS 和其他 TTS 是项目支持的可选引擎，并非当前主引擎。
+项目配置仍指向 **Qwen3-TTS 1.7B** 生成语音，并使用 **Ollama Qwen3 1.7B** 做本地文本分析；旁白可经八重神子 RVC 转换。IndexTTS 和其他 TTS 是项目支持的可选引擎，不是当前主引擎。
 
-本次盘点找到约 **19.79 GiB** 可重新下载的模型权重与模型缓存。清理后保留了代码、运行环境、人物声线锁、声音提示、小说/任务数据和已生成章节音频。删掉权重不会删已生成的音频，但**本机在重新下载相应模型前不能继续用这些模型生成新语音**。
+截至本次交接，确认清单里的本地模型权重已永久删除。清理前逐项统计的模型文件逻辑大小约 **19.79 GiB**；此前卷的可用空间约 **1.9 GiB**，当前 `df -h` 显示约 **17 GiB**（两次实测相差约 **15 GiB**）。这两种口径不同，不能把文件逻辑大小合计当成磁盘可用空间增量；系统期间的其他写入、文件系统分配也会影响差值。代码、运行环境、人物声线锁、声音提示、小说/任务数据和已生成章节音频均保留。删除模型不会影响已经生成的音频，但**重新下载所需模型前，本机无法继续生成新语音或运行神子 RVC 转换**。
 
 这里说的是磁盘空间。删除模型文件会腾出磁盘，不会自动释放已经驻留在其他进程里的 RAM；本次检查时没有活动中的语音生成进程。
 
 ## 本机实际使用的模型
 
-| 用途 | 模型 / 来源 | 清理前本机占用 | 恢复方式 |
+| 用途 | 模型 / 来源 | 清理前本机占用 | 当前状态 / 恢复方式 |
 | --- | --- | ---: | --- |
-| 当前 Qwen3 语音设计 | [`mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit`](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit) | 约 2.9 GiB | 首次使用自动从 Hugging Face 下载；也可运行 `hf download mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit` |
-| 当前 Qwen3 克隆/稳定声线锁 | [`mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit`](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit) | 约 2.9 GiB | 首次需要克隆/声线锁时自动下载；也可运行 `hf download mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit` |
-| 本地文本分析 | [`qwen3:1.7b`](https://ollama.com/library/qwen3) | **0**；`ollama list` 为空 | 安装 Ollama 后运行 `ollama pull qwen3:1.7b` |
-| 八重神子旁白转换 | 社区 RVC [`iroaK/RVC2_YaeMiko_GenshinImpact`](https://huggingface.co/iroaK/RVC2_YaeMiko_GenshinImpact) 的 `.pth` + `.index` | 约 177 MiB | 运行 `./scripts/setup-yae-rvc.sh`；下载地址和文件名在 `model-assets.json` |
-| RVC 转换辅助权重 | `hubert_base.pt`、`rmvpe.pt`、`rmvpe.onnx`；下载源由 `rvc-python==0.1.5` 的 `download_model.py` 指定 | 约 698 MiB | RVC 初始化时会自动补下载；源地址在 `model-assets.json` |
+| 当前 Qwen3 语音设计 | [`mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit`](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit) | 约 2.9 GiB | **已删除**；首次使用会从 Hugging Face 下载，也可运行 `hf download mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit` |
+| 当前 Qwen3 克隆/稳定声线锁 | [`mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit`](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit) | 约 2.9 GiB | **已删除**；首次需要克隆/声线锁时自动下载，也可运行 `hf download mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit` |
+| 本地文本分析 | [`qwen3:1.7b`](https://ollama.com/library/qwen3) | **0**；`ollama list` 为空 | 本机没有 Ollama 模型；安装 Ollama 后运行 `ollama pull qwen3:1.7b` |
+| 八重神子旁白转换 | 社区 RVC [`iroaK/RVC2_YaeMiko_GenshinImpact`](https://huggingface.co/iroaK/RVC2_YaeMiko_GenshinImpact) 的 `.pth` + `.index` | 约 177 MiB | **两个模型文件已删除**；要再次转换需运行 `./scripts/setup-yae-rvc.sh`；地址和文件名在 `model-assets.json` |
+| RVC 转换辅助权重 | `hubert_base.pt`、`rmvpe.pt`、`rmvpe.onnx`；下载源由 `rvc-python==0.1.5` 的 `download_model.py` 指定 | 约 698 MiB | **三个权重已删除**；RVC 初始化时会自动补下载，源地址在 `model-assets.json` |
 
 当前 `config.json` 的 `tts_engine` 是 `qwen3_custom`，使用上表中的 Qwen3 VoiceDesign 和 Base。RVC 开关未在此配置文件里设置，应用默认值为开启；默认模型路径就是上表的 Yae RVC 文件。Yae 社区模型没有可核验的上游 SHA-256，仓库也没有模型卡，声音/数据授权需要使用者单独确认。
 
@@ -28,15 +28,15 @@ Qwen3 的官方原始模型和代码：[`Qwen/Qwen3-TTS`](https://huggingface.co
 
 ## 本机缓存但不是当前主配置
 
-| 模型 | 来源 | 清理前占用 | 说明 |
+| 模型 | 来源 | 清理前占用 | 当前状态 / 说明 |
 | --- | --- | ---: | --- |
-| Qwen3 1.7B CustomVoice 8-bit | [`mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit) | 约 2.9 GiB | 有缓存，当前配置没有选择它 |
-| Qwen3 0.6B CustomVoice 8-bit | [`mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit`](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit) | 约 1.9 GiB | 有缓存，较小的可选/回退模型，不是当前配置 |
-| Whisper Tiny MLX | [`mlx-community/whisper-tiny-mlx`](https://huggingface.co/mlx-community/whisper-tiny-mlx) | 约 71 MiB | 本次在项目源码中没有找到对它的引用，是本机缓存残留，不是当前生成所需 |
+| Qwen3 1.7B CustomVoice 8-bit | [`mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit) | 约 2.9 GiB | **已删除**；原有缓存未被当前配置选择 |
+| Qwen3 0.6B CustomVoice 8-bit | [`mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit`](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit) | 约 1.9 GiB | **已删除**；较小的可选/回退模型，需用时重新下载 |
+| Whisper Tiny MLX | [`mlx-community/whisper-tiny-mlx`](https://huggingface.co/mlx-community/whisper-tiny-mlx) | 约 71 MiB | **已删除**；源码中没有找到对它的引用，是缓存残留，不是当前生成所需 |
 
 ## IndexTTS 权重和内部子模型
 
-IndexTTS 代码来自 [IndexTTS GitHub](https://github.com/index-tts/index-tts)，主模型为 [IndexTeam/IndexTTS-2](https://huggingface.co/IndexTeam/IndexTTS-2)，另有 [ModelScope 镜像](https://modelscope.cn/models/IndexTeam/IndexTTS-2)。本机 `engines/index-tts/checkpoints/` 总计约 **8.3 GiB**；上游 worker 打印的约 5.5 GB 是主模型估算，不含本机实际存在的全部辅助权重。
+IndexTTS 代码来自 [IndexTTS GitHub](https://github.com/index-tts/index-tts)，主模型为 [IndexTeam/IndexTTS-2](https://huggingface.co/IndexTeam/IndexTTS-2)，另有 [ModelScope 镜像](https://modelscope.cn/models/IndexTeam/IndexTTS-2)。清理前本机 `engines/index-tts/checkpoints/` 总计约 **8.3 GiB**；该目录现已删除。上游 worker 打印的约 5.5 GB 是主模型估算，不含本机曾经存在的全部辅助权重。
 
 其中核实到：
 
@@ -46,7 +46,7 @@ IndexTTS 代码来自 [IndexTTS GitHub](https://github.com/index-tts/index-tts)�
 - `funasr/campplus` 约 27 MiB；[Hugging Face](https://huggingface.co/funasr/campplus) / [ModelScope 映射](https://modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common)。
 - NVIDIA BigVGAN 声码器约 428 MiB；[模型页](https://huggingface.co/nvidia/bigvgan_v2_22khz_80band_256x)。
 
-这些地址和 ModelScope 回退映射均按当前本机 IndexTTS 下载代码核对。选用 IndexTTS 时，worker 会自动重新下载缺失权重；本次清理只移除忽略目录 `engines/index-tts/checkpoints/`，保留其余项目代码和 IndexTTS 虚拟环境。
+这些地址和 ModelScope 回退映射均按当前本机 IndexTTS 下载代码核对。选用 IndexTTS 时，worker 会自动重新下载缺失权重。本次只删除忽略目录 `engines/index-tts/checkpoints/`，保留 IndexTTS 代码和虚拟环境。
 
 ## 项目支持的其他本地 TTS 地址
 
@@ -76,17 +76,19 @@ IndexTTS 代码来自 [IndexTTS GitHub](https://github.com/index-tts/index-tts)�
 | Edge TTS | [edge-tts 客户端](https://github.com/rany2/edge-tts) | 连接在线语音服务，不下载本地 TTS 权重 |
 | OpenRouter | [模型目录](https://openrouter.ai/models) | 云端 LLM API，不下载权重 |
 
-## 本次释放空间的范围
+## 已完成的永久删除与保留项
 
-清理前通过 `du` 逐项检查，以下模型和缓存合计约 **19.79 GiB**：
+下列模型权重已按确认清单永久删除。这里的容量是清理前逐项检查得到的逻辑文件大小，合计约 **19.79 GiB**：
 
 1. `~/.cache/huggingface/hub/` 下四个 Qwen3 模型仓库缓存，以及无项目引用的 `whisper-tiny-mlx` 缓存，共约 10.7 GiB。
 2. `engines/index-tts/checkpoints/`，约 8.3 GiB。IndexTTS worker 会在下次使用时从上表来源重建。
 3. `data/rvc/yae_miko/Yae_MikoJP.pth` 与 `.index`，约 177 MiB。要再次使用八重神子 RVC 旁白需重新运行安装脚本。
 4. `data/rvc/venv/lib/python3.10/site-packages/rvc_python/base_model/` 的 HuBERT/RMVPE 权重，约 698 MiB；RVC 初始化时会从 `rvc-python` 下载代码指定的地址。
-5. `data/rvc/venv/lib/python3.10/site-packages/torchcrepe/assets/` 的两个可选 CREPE 权重，约 87 MiB。当前默认音高提取使用 RMVPE；只有选择 CREPE 时才需要。若将来需要但包没有自动恢复，可在 RVC 环境中重装 `torchcrepe`。
+5. `data/rvc/venv/lib/python3.10/site-packages/torchcrepe/assets/` 的两个可选 CREPE 权重，约 87 MiB。当前默认音高提取使用 RMVPE；只有选择 CREPE 时才需要。两个权重已删除；若将来需要但包没有自动恢复，可在 RVC 环境中重装 `torchcrepe`。
 
-本次**不删除** `data/voice_locks/`、`data/voice_prompts/`、`static/audio/`、`data/jobs/`、SQLite 任务记录、小说源文件、代码或 Python 虚拟环境。清理前 `static/audio/` 约 140 MiB、声线锁约 84 MiB、提示音约 3.7 MiB；这些资产与模型权重分开保存。
+本次**保留** `data/voice_locks/`、`data/voice_prompts/`、`static/audio/`、`data/jobs/`、SQLite 任务记录、小说源文件、项目代码和 Python 虚拟环境。清理后复核：`static/audio/` 约 140 MiB、声线锁约 84 MiB、提示音约 3.7 MiB、`data/jobs/` 约 132 MiB、RVC 虚拟环境约 1.0 GiB、IndexTTS 项目代码与虚拟环境约 1.3 GiB。当前卷的可用空间约 17 GiB；清理前约 1.9 GiB，以文件系统实测为准。
+
+清理后目录检查确认 Qwen3 的四个模型仓库、Whisper 缓存、IndexTTS `checkpoints/`、Yae RVC 两个权重、RVC 三个辅助权重和两个 CREPE 权重均不在原路径。已生成音频文件未改动，可继续播放；但本机需要重新生成时，会按上文的恢复方式重新下载权重。
 
 ## 在另一台电脑恢复
 

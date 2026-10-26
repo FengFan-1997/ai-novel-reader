@@ -2,6 +2,25 @@
   "schema_version": 1,
   "audited_at": "2026-10-26",
   "scope": "This catalog records model and runtime asset sources used by this project. Optional engine entries are not necessarily installed or downloaded.",
+  "local_inventory": {
+    "checked_at": "2026-10-26",
+    "measured_model_sizes_are_pre_cleanup": true,
+    "cleanup_status": "permanently_deleted",
+    "selected_model_files_before_cleanup": "about 19.79 GiB logical size",
+    "filesystem_available_space_before_cleanup": "about 1.9 GiB",
+    "filesystem_available_space_after_cleanup": "about 17 GiB according to df -h",
+    "measured_available_space_increase": "about 15 GiB between checks; filesystem free-space change is not equal to the sum of logical file sizes",
+    "preserved_paths": [
+      "data/voice_locks/",
+      "data/voice_prompts/",
+      "static/audio/",
+      "data/jobs/",
+      "data/jobs.db",
+      "data/streaming_jobs.db",
+      "data/rvc/venv/",
+      "engines/index-tts/ (excluding checkpoints/)"
+    ]
+  },
   "bootstrap": {
     "ollama": {
       "config_key": "llm_local_model",

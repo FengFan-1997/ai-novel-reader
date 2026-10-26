@@ -7,6 +7,9 @@ def test_model_manifest_covers_setup_and_runtime_assets():
     manifest = json.loads((project / "model-assets.json").read_text(encoding="utf-8"))
     assets = {asset["id"]: asset for asset in manifest["assets"]}
 
+    assert manifest["local_inventory"]["cleanup_status"] == "permanently_deleted"
+    assert manifest["local_inventory"]["measured_model_sizes_are_pre_cleanup"] is True
+    assert "static/audio/" in manifest["local_inventory"]["preserved_paths"]
     assert manifest["bootstrap"]["ollama"]["config_key"] == "llm_local_model"
     assert manifest["bootstrap"]["index_tts_repository"].startswith("https://github.com/")
     assert {
